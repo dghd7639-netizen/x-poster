@@ -2,7 +2,7 @@ import { existsSync } from 'node:fs';
 import { mkdir, readFile, readlink, unlink } from 'node:fs/promises';
 import { join, delimiter } from 'node:path';
 import { homedir } from 'node:os';
-import { spawn } from 'node:child_process';
+import { spawn, execFile } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
 import { XPosterError } from './errors.mjs';
 
@@ -118,7 +118,9 @@ export class CDPConnection {
 
 const children = new Set();
 process.on('exit', () => {
-  for (const child of children) child.kill();
+  for (const child of children) {
+    try { child.kill(); } catch { /* Continue cleaning up other owned browsers. */ }
+  }
 });
 
 export function chromeArgs({ profileDir, debugging, headless = false, url = 'about:blank' }) {
@@ -132,7 +134,7 @@ export function chromeArgs({ profileDir, debugging, headless = false, url = 'abo
     args.push('--remote-debugging-port=0');
     if (headless) args.push('--headless=new');
   }
-  args.push(url);
+  if (url != null) args.push(url);
   return args;
 }
 
@@ -158,19 +160,24 @@ export async function openPlainWindow({ profileDir, executablePath, url }) {
 
 export async function profileInUse(profileDir) {
   if (process.platform === 'win32') return false;
-  let lock;
-  try { lock = await readlink(join(profileDir, 'SingletonLock')); }
-  catch { return false; }
-  const suffix = lock.slice(lock.lastIndexOf('-') + 1);
-  if (!lock.includes('-') || !/^\d+$/.test(suffix)) return false;
-  const pid = Number(suffix);
-  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  const pid = await profilePid(profileDir);
+  if (!pid) return false;
   try {
     process.kill(pid, 0);
     return true;
   } catch (error) {
     return error.code === 'EPERM';
   }
+}
+
+async function profilePid(profileDir) {
+  let lock;
+  try { lock = await readlink(join(profileDir, 'SingletonLock')); }
+  catch { return null; }
+  const suffix = lock.slice(lock.lastIndexOf('-') + 1);
+  if (!lock.includes('-') || !/^\d+$/.test(suffix)) return null;
+  const pid = Number(suffix);
+  return Number.isSafeInteger(pid) && pid > 0 ? pid : null;
 }
 
 function profileBusy() {
@@ -190,58 +197,105 @@ async function endpoint(profileDir) {
   return null;
 }
 
-async function launch({ profileDir, executablePath, headless }) {
+async function launch({ profileDir, executablePath, headless, foreground }, runtime) {
   await mkdir(profileDir, { recursive: true, mode: 0o700 });
   await unlink(join(profileDir, 'DevToolsActivePort')).catch(error => {
     if (error.code !== 'ENOENT') throw error;
   });
-  const args = chromeArgs({ profileDir, debugging: true, headless });
-  let child;
+  const appPath = executablePath.match(/^(\/.*\.app)\/Contents\/MacOS\/[^/]+$/)?.[1];
+  const background = runtime.platform === 'darwin' && !headless && !foreground && Boolean(appPath);
+  const args = chromeArgs({ profileDir, debugging: true, headless, ...(background ? { url: null } : {}) });
+  let child = null;
   let spawnError;
-  try { child = spawn(executablePath, args, { stdio: 'ignore' }); }
-  catch {
-    throw new XPosterError('BROWSER_NOT_FOUND', '无法启动指定的 Chrome。', { hint: '请检查 X_POSTER_CHROME_PATH。' });
+  if (background) {
+    try {
+      await new Promise((resolve, reject) => {
+        runtime.execFile('open', ['-g', '-n', '-a', appPath, '--args', ...args, '--no-startup-window'],
+          { timeout: 20000 }, error => error ? reject(error) : resolve());
+      });
+    } catch (error) {
+      throw new XPosterError(error.code === 'ENOENT' ? 'BROWSER_NOT_FOUND' : 'BROWSER_LAUNCH_FAILED',
+        '无法在后台启动指定的 Chrome。', { hint: '请检查 X_POSTER_CHROME_PATH 和浏览器安装。' });
+    }
+  } else {
+    try { child = runtime.spawn(executablePath, args, { stdio: 'ignore' }); }
+    catch {
+      throw new XPosterError('BROWSER_NOT_FOUND', '无法启动指定的 Chrome。', { hint: '请检查 X_POSTER_CHROME_PATH。' });
+    }
+    children.add(child);
+    child.once('error', error => { spawnError = error; children.delete(child); });
+    child.once('exit', () => children.delete(child));
   }
-  children.add(child);
-  child.once('error', error => { spawnError = error; children.delete(child); });
-  child.once('exit', () => children.delete(child));
+  let cdp;
   try {
-    const deadline = Date.now() + 20000;
-    while (Date.now() < deadline) {
+    const deadline = runtime.now() + 20000;
+    while (runtime.now() < deadline) {
       if (spawnError) {
         throw new XPosterError('BROWSER_NOT_FOUND', '无法启动指定的 Chrome。', { hint: '请检查 X_POSTER_CHROME_PATH。' });
       }
       const url = await endpoint(profileDir);
-      if (url) return { cdp: await CDPConnection.connect(url), child };
-      if (child.exitCode !== null || child.signalCode !== null) {
+      if (url) {
+        cdp = await runtime.connect(url);
+        let pid = null;
+        if (background) {
+          try {
+            const { processInfo } = await cdp.send('SystemInfo.getProcessInfo', {}, undefined, 2000);
+            const id = processInfo?.find(info => info.type === 'browser')?.id;
+            if (Number.isSafeInteger(id) && id > 0) pid = id;
+          } catch { /* Older browsers may not expose SystemInfo. */ }
+          pid ??= await profilePid(profileDir);
+          if (!pid) throw new XPosterError('BROWSER_LAUNCH_FAILED', '无法确定后台 Chrome 的进程。');
+        }
+        return { cdp, child, pid, background };
+      }
+      if (child && (child.exitCode !== null || child.signalCode !== null)) {
         throw new XPosterError('BROWSER_BUSY', `Chrome 提前退出，可能有其他 Chrome 正在使用此配置目录：${profileDir}`, {
           hint: '请关闭使用该目录的 Chrome 后再试。',
         });
       }
-      await delay(100);
+      await runtime.delay(100);
     }
     throw new XPosterError('BROWSER_LAUNCH_FAILED', 'Chrome 启动超时。', { hint: '请检查浏览器能否正常启动。' });
   } catch (error) {
-    child.kill();
+    if (child) child.kill();
+    else {
+      const pid = await profilePid(profileDir);
+      if (cdp) {
+        await cdp.send('Browser.close', {}, undefined, 2000).catch(() => {});
+        cdp.close();
+      }
+      if (pid) {
+        try { runtime.kill(pid, 'SIGKILL'); } catch { /* The browser may already have exited. */ }
+      }
+    }
     if (error instanceof XPosterError) throw error;
     throw new XPosterError('BROWSER_LAUNCH_FAILED', 'Chrome 启动后无法连接。', { hint: '请关闭此配置目录的 Chrome 后再试。' });
   }
 }
 
 export class Browser {
-  constructor(cdp, child = null) {
+  constructor(cdp, child = null, { pid = null, background = false, runtime = {} } = {}) {
     this.cdp = cdp;
     this.child = child;
-    this.owned = child !== null;
+    this.pid = pid;
+    this.background = background;
+    this.runtime = { now: Date.now, delay, kill: (pid, signal) => process.kill(pid, signal), ...runtime };
+    this.owned = child !== null || pid !== null;
+    if (pid !== null) {
+      this.processHandle = { kill: signal => this.runtime.kill(pid, signal) };
+      children.add(this.processHandle);
+    }
     this.usedInitialPage = false;
     this.targets = new Set();
     this.closePromise = null;
   }
 
-  static async open({ profileDir, executablePath, headless }) {
+  static async open({ profileDir, executablePath, headless, foreground }, dependencies = {}) {
+    const runtime = { platform: process.platform, spawn, execFile, connect: CDPConnection.connect,
+      now: Date.now, delay, kill: (pid, signal) => process.kill(pid, signal), ...dependencies };
     const url = await endpoint(profileDir);
     if (url) {
-      try { return new Browser(await CDPConnection.connect(url, 2000)); }
+      try { return new Browser(await runtime.connect(url, 2000), null, { runtime }); }
       catch { /* A stale port file is expected after an interrupted Chrome session. */ }
     }
     if (await profileInUse(profileDir)) {
@@ -252,8 +306,10 @@ export class Browser {
         hint: '请安装 Chrome，或设置 X_POSTER_CHROME_PATH。',
       });
     }
-    const { cdp, child } = await launch({ profileDir, executablePath, headless });
-    return new Browser(cdp, child);
+    // Keep configuration lazy: Chrome helpers are also used before callers initialise their environment.
+    foreground ??= (await import('./config.mjs')).config.foreground;
+    const { cdp, child, pid, background } = await launch({ profileDir, executablePath, headless, foreground }, runtime);
+    return new Browser(cdp, child, { pid, background, runtime });
   }
 
   async isHeadless() {
@@ -274,7 +330,7 @@ export class Browser {
 
   async newPage() {
     let targetId;
-    if (this.owned && !this.usedInitialPage) {
+    if (this.owned && !this.background && !this.usedInitialPage) {
       this.usedInitialPage = true;
       const deadline = Date.now() + 2000;
       do {
@@ -284,7 +340,13 @@ export class Browser {
         await delay(100);
       } while (Date.now() < deadline);
     }
-    if (!targetId) ({ targetId } = await this.cdp.send('Target.createTarget', { url: 'about:blank' }));
+    if (!targetId) {
+      const { targetInfos } = await this.cdp.send('Target.getTargets');
+      const hasPage = targetInfos.some(target => target.type === 'page');
+      ({ targetId } = await this.cdp.send('Target.createTarget', {
+        url: 'about:blank', background: true, ...(!hasPage ? { newWindow: true } : {}),
+      }));
+    }
     this.targets.add(targetId);
     try {
       const { sessionId } = await this.cdp.send('Target.attachToTarget', { targetId, flatten: true });
@@ -304,7 +366,7 @@ export class Browser {
     try {
       if (this.owned) {
         await this.cdp.send('Browser.close', {}, undefined, 2000).catch(() => {});
-        if (this.child.exitCode === null && this.child.signalCode === null) {
+        if (this.child && this.child.exitCode === null && this.child.signalCode === null) {
           await new Promise(resolve => {
             const exited = () => { clearTimeout(timer); resolve(); };
             const timer = setTimeout(() => {
@@ -314,6 +376,21 @@ export class Browser {
             }, 10000);
             this.child.once('exit', exited);
           });
+        } else if (!this.child && this.pid !== null) {
+          const deadline = this.runtime.now() + 10000;
+          while (true) {
+            try { this.runtime.kill(this.pid, 0); }
+            catch (error) {
+              if (error.code === 'ESRCH') break;
+            }
+            if (this.runtime.now() >= deadline) {
+              try { this.processHandle.kill('SIGKILL'); }
+              catch (error) { if (error.code !== 'ESRCH') throw error; }
+              break;
+            }
+            await this.runtime.delay(100);
+          }
+          children.delete(this.processHandle);
         }
       } else {
         for (const targetId of this.targets) {

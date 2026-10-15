@@ -189,6 +189,7 @@ test('reused browser closes only created targets', async () => {
     closed: false,
     send: async (method, params) => {
       calls.push([method, params]);
+      if (method === 'Target.getTargets') return { targetInfos: [{ type: 'page', targetId: 'existing' }] };
       if (method === 'Target.createTarget') return { targetId: 'ours' };
       if (method === 'Target.attachToTarget') return { sessionId: 'session' };
       return {};

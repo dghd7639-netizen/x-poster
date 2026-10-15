@@ -20,6 +20,8 @@
 
 零依赖，无需为运行插件安装第三方 npm 包。
 
+macOS 默认让自动化 Chrome 在当前应用后方运行，不抢焦点。窗口仍存在于其他窗口后面，可点击 Chrome 查看；设置 `X_POSTER_FOREGROUND=1` 可让窗口来到前台。登录窗口仍在前台打开。不推荐无头模式：X 很容易识别它。
+
 ## 安装到 Claude Code
 
 从本地仓库安装，将占位符替换为实际绝对路径：
@@ -204,7 +206,8 @@ node server/cli.mjs article-cover --id '123' --cover ./cover.png
 |---|---|---|
 | `X_POSTER_HOME` | `~/.x-poster` | 数据目录，包含专用 profile、历史、状态及保留 7 天的预览。 |
 | `X_POSTER_CHROME_PATH` | 自动检测 | 浏览器可执行文件路径；自动检测依次尝试 Chrome、Chromium、Edge、Brave。 |
-| `X_POSTER_HEADLESS` | `0` | 设为 `1` 后发布使用无窗口模式；登录始终显示窗口。 |
+| `X_POSTER_HEADLESS` | `0` | 设为 `1` 后发布使用无窗口模式；X 很容易识别，不推荐使用。登录始终显示窗口。 |
+| `X_POSTER_FOREGROUND` | `0` | 设为 `1`（也支持 `true`、`yes`、`on`）后直接启动 Chrome，让窗口来到前台；macOS 默认在后台运行。 |
 | `X_POSTER_MIN_INTERVAL_SEC` | `60` | 两次发布之间的最小秒数；`0` 关闭此限制。 |
 | `X_POSTER_DAILY_LIMIT` | `20` | 滚动 24 小时的最大发布数量；`0` 关闭此限制。 |
 | `X_POSTER_TOOL_WAIT_SEC` | `45` | MCP 草稿创建／状态查询单次等待秒数，限制在 5–300；无效值回退默认。应小于客户端工具超时。CLI 始终等待完成。 |
@@ -222,7 +225,7 @@ Claude Code 可通过启动 shell 设置变量，或合并到 `~/.claude/setting
 }
 ```
 
-Codex 在启动它的 shell 中设置变量；当前插件的 `env_vars` 放行原有 5 个变量（HOME、CHROME_PATH、HEADLESS、MIN_INTERVAL_SEC、DAILY_LIMIT）。新增等待／退出变量需由宿主传入 MCP 进程；本次未修改 `.codex-mcp.json`。直接启动服务器或 CLI 时可通过 shell 设置。例如：
+Codex 在启动它的 shell 中设置变量；当前插件的 `env_vars` 放行原有 5 个变量（HOME、CHROME_PATH、HEADLESS、MIN_INTERVAL_SEC、DAILY_LIMIT）。新增前台／等待／退出变量需由宿主传入 MCP 进程；本次未修改 `.codex-mcp.json`。直接启动服务器或 CLI 时可通过 shell 设置。例如：
 
 ```bash
 export X_POSTER_HEADLESS=0

@@ -10,6 +10,8 @@ description: >-
 
 使用 MCP 服务器 `x-poster`，默认先预览、确认，再发布。
 
+macOS 上自动化浏览器默认在后台运行，不抢焦点；需要查看时可点击 Chrome，或设置 `X_POSTER_FOREGROUND=1`，登录窗口仍在前台打开。
+
 ## 工作流程
 
 1. 调用 `x_status`（无参数），查看登录态、用户名与发布额度。

@@ -27,6 +27,7 @@ export const config = {
   previewsDir: join(home, 'previews'),
   chromePath: process.env.X_POSTER_CHROME_PATH || null,
   headless: /^(1|true|yes|on)$/i.test(process.env.X_POSTER_HEADLESS || ''),
+  foreground: /^(1|true|yes|on)$/i.test(process.env.X_POSTER_FOREGROUND || ''),
   minIntervalSec: numberSetting(process.env.X_POSTER_MIN_INTERVAL_SEC, 60),
   dailyLimit: numberSetting(process.env.X_POSTER_DAILY_LIMIT, 20),
   toolWaitSec: toolWaitSetting(process.env.X_POSTER_TOOL_WAIT_SEC),
