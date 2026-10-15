@@ -20,6 +20,7 @@ test('CLI help and invalid inputs never need Chrome', async t => {
   assert.match(help.stdout, /cancel/);
   assert.match(help.stdout, /--id/);
   assert.match(help.stdout, /article-draft/);
+  assert.match(help.stdout, /article-cover/);
   assert.match(help.stdout, /article-publish/);
   assert.match(help.stdout, /article-delete/);
   assert.match(help.stdout, /--cover/);
@@ -36,9 +37,16 @@ test('CLI help and invalid inputs never need Chrome', async t => {
   for (const args of [['article-draft'], ['article-draft', '--file', './missing.md'], ['article-draft', '--file', './bad.txt'],
     ['article-publish'], ['article-delete', '--id', '123\n'], ['article-publish', '--id', 'no'],
     ['article-draft', '--file', './missing.md', '--text', 'ignored'], ['article-delete', '--id', '123', '--cover', './a.png'],
+    ['article-cover'], ['article-cover', '--id', 'abc', '--cover', './cover.png'],
+    ['article-cover', '--id', '123'], ['article-cover', '--id', '123', '--cover', './cover.gif'],
+    ['article-cover', '--id', '123', '--cover', './missing.png'],
+    ['article-cover', '--id', '123', '--file', './article.md'],
+    ['article-cover', '--id', '123', '--cover', './cover.png', '--title', 'ignored'],
     ['preview', '--file', './a.md']]) {
     const result = run(args);
     assert.equal(result.status, 1);
     assert.equal(JSON.parse(result.stderr).code, 'INVALID_INPUT');
   }
+  const relative = run(['article-cover', '--id', '123', '--cover', './missing.png']);
+  assert.match(JSON.parse(relative.stderr).message, /不存在或无法读取/);
 });

@@ -66,21 +66,38 @@ function watchRequests(page) {
     mark: () => sequence,
     updates: after => [...requests.values()].filter(record => record.sequence > after && /^ArticleEntityUpdate/.test(record.operation)),
     lastUpdateAt: () => lastUpdateAt,
-    mutation: (pattern, id) => [...requests.values()].find(record => pattern.test(record.operation)
+    mutation: (pattern, id, after = 0) => [...requests.values()].find(record => record.sequence > after && pattern.test(record.operation)
       && String(record.variables?.articleEntityId ?? record.variables?.article_id ?? record.variables?.articleId ?? '') === id && record.done),
     stop() { stopped = true; off.forEach(unsubscribe => unsubscribe()); },
   };
 }
 
-async function waitEditor(page, id) {
+async function waitEditor(page, id, operation) {
+  const existingDraft = operation === 'cover';
   const ready = await page.waitFor((selectors, expectedId) => {
     if (/\/i\/flow\/login/.test(location.pathname)) return 'login';
     if (/\/account\/access/.test(location.pathname)) return 'challenge';
     const title = [...document.querySelectorAll('textarea')].find(el => /标题|title/i.test(el.placeholder));
-    return location.pathname === `/compose/articles/edit/${expectedId}` && title && document.querySelector(selectors.composer) ? 'ready' : null;
+    if (location.pathname !== `/compose/articles/edit/${expectedId}`) return null;
+    const composer = document.querySelector(selectors.composer);
+    if (title && composer) return 'ready';
+    // The left article list also says "Published"; require the reader's Unpublish control.
+    const reader = document.querySelector('main, [role=main]');
+    if (!title && !composer && reader && [...reader.querySelectorAll('button, [role=button], [role=menuitem]')]
+      .some(el => !el.closest(selectors.dialog) && /^(取消发布(?:[，,、].*)?|Unpublish\b.*)$/i
+        .test((el.innerText || el.textContent || el.getAttribute('aria-label') || '').trim()))) return 'published';
+    return null;
   }, [ARTICLE_SELECTORS, id]);
   if (ready === 'login') throw new XPosterError('NOT_LOGGED_IN', 'X 登录已过期，请调用 x_login 让用户自行登录。');
   if (ready === 'challenge') throw new XPosterError('ACCOUNT_CHALLENGE', 'X 要求验证，请让用户在普通登录窗口中自行处理。');
+  if (ready === 'published') {
+    const message = existingDraft ? '该文章已发布，x_article_cover 只能用于草稿。如需更换已发布文章的封面，请让用户在 X 网页上操作。'
+      : operation === 'delete' ? '该文章已发布，x_article_delete 只删除草稿。' : '该文章已发布。';
+    throw new XPosterError('INVALID_INPUT', message, { article_id: id, edit_url: editURL(id) });
+  }
+  if (existingDraft && await page.call(() => location.pathname) !== `/compose/articles/edit/${id}`) {
+    throw new XPosterError('INVALID_INPUT', '文章草稿不存在或无法打开。');
+  }
   if (ready !== 'ready') throw new XPosterError('UI_CHANGED', '文章编辑器未加载或文章 id 不匹配。', { edit_url: editURL(id) });
 }
 
@@ -153,15 +170,36 @@ function snapshot(selectors) {
   const composer = document.querySelector(selectors.composer);
   const images = composer ? Math.max(composer.querySelectorAll('img').length, composer.querySelectorAll(selectors.removeMedia).length) : 0;
   const bodyText = document.body.innerText || '';
-  const cover = document.querySelector(selectors.cover);
+  // X keeps the change-cover button after upload; the media can be its sibling.
+  const anchors = [...document.querySelectorAll(selectors.cover), ...document.querySelectorAll(selectors.fileInput)]
+    .filter(el => !el.closest(selectors.dialog) && !el.closest(selectors.composer));
+  const coverMedia = [];
+  const cover = anchors.some(anchor => {
+    for (let area = anchor; area && !area.contains(composer) && !area.querySelector('textarea'); area = area.parentElement) {
+      const media = [...area.querySelectorAll('img, video')].filter(el => !el.closest(selectors.dialog) && !el.closest(selectors.composer));
+      if (media.length) { coverMedia.push(...media); return true; }
+    }
+    return false;
+  });
+  const coverImages = coverMedia.filter(el => el.tagName === 'IMG');
+  const coverImage = coverImages.find(el => el.getBoundingClientRect().width > 300) ?? coverImages[0];
   return {
     title, text: composer?.innerText || composer?.textContent || '', images,
     saved: bodyText.match(/(?:上一次保存|Last saved)[^\n]*/i)?.[0] ?? null,
     wordCount: bodyText.match(/\b[\d,]+\s*(?:个字|字|words?)\b/i)?.[0]
       ?? bodyText.match(/[\d,]+\s*(?:个字|字)/)?.[0] ?? null,
-    cover: !!cover?.querySelector('img, video')
-      || [...document.querySelectorAll(selectors.fileInput)].some(input => !input.closest(selectors.dialog) && !!input.parentElement?.querySelector('img, video')),
+    cover,
+    coverLoaded: !!coverImage?.complete && coverImage.naturalWidth > 0,
   };
+}
+
+async function waitCoverImage(page) {
+  const deadline = Date.now() + 20000;
+  for (;;) {
+    if ((await page.call(snapshot, ARTICLE_SELECTORS)).coverLoaded) return undefined;
+    if (Date.now() >= deadline) return '封面已保存，但图片加载超时，截图可能尚未显示封面。';
+    await delay(250);
+  }
 }
 
 async function insertImages(page, paths) {
@@ -184,24 +222,46 @@ async function insertImages(page, paths) {
     const detail = await page.call(selector => document.querySelector(selector)?.innerText || '', ARTICLE_SELECTORS.dialog);
     throw new XPosterError('UPLOAD_FAILED', `文章图片上传未完成。${detail ? `提示：${detail}` : ''}`);
   }
+  await waitMediaProcessed(page);
+}
+
+async function waitMediaProcessed(page) {
   // X keeps the editor behind an overlay ("正在处理媒体… 取消上传") until the media finishes processing.
   const processed = await page.waitFor(() => {
     const text = document.body.innerText || '';
     const cancel = [...document.querySelectorAll('button')].some(el => /^(取消上传|Cancel upload)$/i.test((el.innerText || '').trim()));
     return !cancel && !/正在处理媒体|Processing media/i.test(text);
   }, [], { timeout: 120000 });
-  if (!processed) throw new XPosterError('UPLOAD_FAILED', '文章图片在 X 端处理超时（正在处理媒体）。');
+  if (!processed) throw new XPosterError('UPLOAD_FAILED', '文章媒体在 X 端处理超时（正在处理媒体）。');
 }
 
-async function insertCover(page, path) {
+async function chooseCoverFile(page, path) {
+  let chooser;
+  const off = page.on('Page.fileChooserOpened', event => { chooser = event; });
+  try {
+    await page.send('Page.setInterceptFileChooserDialog', { enabled: true });
+    await clickWhenReady(page, ARTICLE_SELECTORS.cover);
+    const deadline = Date.now() + 10000;
+    while (!chooser && Date.now() < deadline) await delay(100);
+    if (!chooser?.backendNodeId) throw new XPosterError('UPLOAD_FAILED', '文章封面文件选择器未打开。');
+    await page.send('DOM.enable');
+    await page.send('DOM.setFileInputFiles', { backendNodeId: chooser.backendNodeId, files: [path] });
+  } finally {
+    off();
+    await page.send('Page.setInterceptFileChooserDialog', { enabled: false }).catch(() => {});
+  }
+}
+
+async function insertCover(page, path, hadCover = false) {
   const selector = await page.call(selectors => {
-    const input = [...document.querySelectorAll(selectors.fileInput)].find(el => !el.closest(selectors.dialog));
+    const input = [...document.querySelectorAll(selectors.fileInput)].find(el => !el.closest(selectors.dialog) && !el.closest(selectors.composer));
     if (!input) return null;
     input.setAttribute('data-x-poster-article', 'coverInput');
     return '[data-x-poster-article="coverInput"]';
   }, ARTICLE_SELECTORS);
-  if (!selector) throw new XPosterError('UI_CHANGED', '找不到文章封面上传控件。');
-  await page.setFiles(selector, [path]);
+  if (selector) await page.setFiles(selector, [path]);
+  else if (hadCover) await chooseCoverFile(page, path);
+  else throw new XPosterError('UI_CHANGED', '找不到文章封面上传控件。');
   if (!await page.waitFor(selector => !!document.querySelector(selector), [ARTICLE_SELECTORS.dialog], { timeout: 120000 })) {
     throw new XPosterError('UPLOAD_FAILED', '文章封面裁剪窗口未出现。');
   }
@@ -209,6 +269,7 @@ async function insertCover(page, path) {
   if (!await page.waitFor(selector => !document.querySelector(selector), [ARTICLE_SELECTORS.dialog], { timeout: 120000 })) {
     throw new XPosterError('UPLOAD_FAILED', '文章封面裁剪未完成，请检查“应用”按钮。');
   }
+  await waitMediaProcessed(page);
 }
 
 async function waitSaved(page, watcher, mark, savedBefore, lastEdit, id) {
@@ -279,14 +340,15 @@ export async function createArticleDraft(browser, { title, segments, cover, scre
     }
     const final = await waitSaved(page, watcher, mark, savedBefore, lastEdit, articleId);
     const expected = segments.reduce((sum, segment) => sum + (segment.paths?.length ?? 0), 0);
-    if (final.title !== title || !final.text.trim() && !final.images || final.images !== expected || !!cover && !final.cover) {
+    if (final.title !== title || !final.text.trim() && !final.images || final.images !== expected) {
       throw uncertain(articleId, '文章标题、正文、图片数量或封面与预期不一致，请检查草稿。');
     }
     await page.call(selector => { window.scrollTo(0, 0); document.querySelector(selector)?.scrollIntoView({ block: 'start' }); }, 'textarea');
+    const warning = cover ? await waitCoverImage(page) : undefined;
     const screenshot = await page.screenshot();
     await writeFile(screenshotPath, screenshot, { mode: 0o600 });
     return { article_id: articleId, edit_url: editURL(articleId), title, images_inserted: final.images,
-      images_expected: expected, cover: final.cover, word_count_text: final.wordCount, screenshot };
+      images_expected: expected, cover: !!cover || final.cover, word_count_text: final.wordCount, screenshot, ...(warning ? { warning } : {}) };
   } catch (error) {
     if (articleId) {
       if (!(error instanceof XPosterError)) throw uncertain(articleId, '已创建文章草稿，但后续操作未完成，请检查草稿。');
@@ -299,10 +361,37 @@ export async function createArticleDraft(browser, { title, segments, cover, scre
   }
 }
 
-async function waitMutation(watcher, pattern, id, timeout = 60000) {
+export async function setArticleCover(browser, articleId, { cover, screenshotPath }) {
+  const page = await browser.newPage();
+  const watcher = watchRequests(page);
+  let attempted = false;
+  try {
+    await page.send('Network.enable');
+    await page.navigate(editURL(articleId));
+    await waitEditor(page, articleId, 'cover');
+    const replaced = (await page.call(snapshot, ARTICLE_SELECTORS)).cover;
+    const mark = watcher.mark();
+    attempted = true;
+    await insertCover(page, cover, replaced);
+    const response = await waitMutation(watcher, /^ArticleEntityUpdateCoverMedia$/, articleId, 60000, mark);
+    // GraphQL errors also leave the save unconfirmed: report UNCERTAIN, never retry automatically.
+    if (!response?.ok) throw uncertain(articleId, '无法确认文章封面已保存。');
+    await page.call(() => window.scrollTo(0, 0));
+    const warning = await waitCoverImage(page);
+    const screenshot = await page.screenshot();
+    await writeFile(screenshotPath, screenshot, { mode: 0o600 });
+    return { article_id: articleId, edit_url: editURL(articleId), replaced, cover: true, screenshot, ...(warning ? { warning } : {}) };
+  } catch (error) {
+    if (attempted && !(error instanceof XPosterError)) throw uncertain(articleId, '文章封面操作未完成，请检查草稿。');
+    if (error instanceof XPosterError) error.details = { article_id: articleId, edit_url: editURL(articleId), ...error.details };
+    throw error;
+  } finally { watcher.stop(); await page.close().catch(() => {}); }
+}
+
+async function waitMutation(watcher, pattern, id, timeout = 60000, after = 0) {
   const deadline = Date.now() + timeout;
   do {
-    const record = watcher.mutation(pattern, id);
+    const record = watcher.mutation(pattern, id, after);
     if (record) return record;
     if (Date.now() >= deadline) return null;
     await delay(250);
@@ -336,7 +425,7 @@ export async function publishArticle(browser, articleId) {
   try {
     await page.send('Network.enable');
     await page.navigate(editURL(articleId));
-    await waitEditor(page, articleId);
+    await waitEditor(page, articleId, 'publish');
     if (!(await page.call(snapshot, ARTICLE_SELECTORS)).title.trim()) {
       throw new XPosterError('INVALID_INPUT', '文章标题不能为空。');
     }
@@ -373,7 +462,7 @@ export async function deleteArticleDraft(browser, articleId) {
   try {
     await page.send('Network.enable');
     await page.navigate(editURL(articleId));
-    await waitEditor(page, articleId);
+    await waitEditor(page, articleId, 'delete');
     await page.press('Escape');
     await clickAction(page, 'more');
     if (!await page.waitFor(selector => !!document.querySelector(selector), [ARTICLE_SELECTORS.menuItem], { timeout: 10000 })) {

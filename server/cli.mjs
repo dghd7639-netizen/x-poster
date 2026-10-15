@@ -3,7 +3,7 @@ import { parseArgs } from 'node:util';
 import { resolve } from 'node:path';
 import { expandHome } from './config.mjs';
 import { XPosterError } from './errors.mjs';
-import { status, preview, post, schedule, listScheduled, cancelScheduled, openUserWindow, articleDraft, articlePublish, articleDelete } from './tools.mjs';
+import { status, preview, post, schedule, listScheduled, cancelScheduled, openUserWindow, articleDraft, articleCover, articlePublish, articleDelete } from './tools.mjs';
 
 const usage = `x-poster 命令行（需要 Node.js 22 或更高版本）
 
@@ -19,6 +19,7 @@ const usage = `x-poster 命令行（需要 Node.js 22 或更高版本）
   scheduled 查看预排期帖子列表
   cancel   按 id 取消已经由用户确认的一个预排期帖子
   article-draft   从 Markdown 新建 X 文章草稿并截图，需符合资格的 Premium 账号
+  article-cover   为已有文章草稿添加或替换封面，不发布
   article-publish 发布用户已经审阅并明确确认的文章草稿
   article-delete  删除用户已经明确确认的文章草稿
 
@@ -26,16 +27,17 @@ const usage = `x-poster 命令行（需要 Node.js 22 或更高版本）
   --text <文字>     文字中的字面量 \\n 会转换为换行
   --image <路径>    可重复使用，最多 4 张；支持绝对路径、相对路径和 ~
   --at <ISO>       预排期时间；无偏移量时使用电脑本地时区，至少 5 分钟后
-  --id <数字>      cancel 的排期 id 或 article-publish / article-delete 的文章 id
+  --id <数字>      cancel 的排期 id 或 article-cover / article-publish / article-delete 的文章 id
   --file <路径>    article-draft 的 .md 文件，最多 1 MB；支持相对路径
   --title <标题>   article-draft 的可选标题，覆盖 Markdown 标题
-  --cover <路径>   article-draft 的可选本地封面，覆盖 front matter cover
+  --cover <路径>   article-cover 的本地封面，或 article-draft 的可选封面；支持相对路径
   -h, --help        显示帮助
 
 先预览，再请用户确认，最后用完全相同的内容发布。
 登录可使用 Google/Apple 账号；完成后按 Cmd+Q 完全退出该 Chrome（Windows/Linux 关闭它的所有窗口）。
 请勿索要或代填密码；遇到 UNCERTAIN 不要重试，请用户检查主页或预排期列表。
-文章始终先 article-draft，展示截图、警告和 edit_url；用户确认这个 id 后才 article-publish。
+新文章先 article-draft，展示截图、警告和 edit_url；用户确认这个 id 后才 article-publish。
+已有草稿用 article-cover --id <id> --cover <图片> 添加或替换封面，并展示返回截图。
 article-delete 仅删除本次创建或用户明确提供 id 并确认的草稿；文章不确定结果检查 x.com/compose/articles。
 `;
 
@@ -66,11 +68,14 @@ async function main() {
   if (values.at !== undefined && !['preview', 'schedule'].includes(command)) {
     throw new XPosterError('INVALID_INPUT', '--at 仅用于 preview 或 schedule。');
   }
-  if (values.id !== undefined && !['cancel', 'article-publish', 'article-delete'].includes(command)) {
-    throw new XPosterError('INVALID_INPUT', '--id 仅用于 cancel、article-publish 或 article-delete。');
+  if (values.id !== undefined && !['cancel', 'article-cover', 'article-publish', 'article-delete'].includes(command)) {
+    throw new XPosterError('INVALID_INPUT', '--id 仅用于 cancel、article-cover、article-publish 或 article-delete。');
   }
-  if (['file', 'title', 'cover'].some(key => values[key] !== undefined) && command !== 'article-draft') {
-    throw new XPosterError('INVALID_INPUT', '--file、--title 和 --cover 仅用于 article-draft。');
+  if (['file', 'title'].some(key => values[key] !== undefined) && command !== 'article-draft') {
+    throw new XPosterError('INVALID_INPUT', '--file 和 --title 仅用于 article-draft。');
+  }
+  if (values.cover !== undefined && !['article-draft', 'article-cover'].includes(command)) {
+    throw new XPosterError('INVALID_INPUT', '--cover 仅用于 article-draft 或 article-cover。');
   }
   if (command.startsWith('article-') && (values.text !== undefined || values.image !== undefined)) {
     throw new XPosterError('INVALID_INPUT', '文章命令请使用 --file 或 --id，不接受 --text / --image。');
@@ -106,6 +111,9 @@ async function main() {
       markdown_path: values.file === undefined ? undefined : resolve(expandHome(values.file)),
       ...(values.title !== undefined ? { title: values.title } : {}),
       ...(values.cover !== undefined ? { cover: resolve(expandHome(values.cover)) } : {}),
+    })).data); return 0;
+    case 'article-cover': print((await articleCover({ article_id: values.id,
+      cover: values.cover === undefined ? undefined : resolve(expandHome(values.cover)),
     })).data); return 0;
     case 'article-publish': print((await articlePublish({ article_id: values.id })).data); return 0;
     case 'article-delete': print((await articleDelete({ article_id: values.id })).data); return 0;

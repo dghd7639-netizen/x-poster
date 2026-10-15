@@ -2,7 +2,7 @@
 
 让 Claude Code 和 Codex 通过本机 Chrome 在 X（Twitter）发布文字和最多 4 张本地图片。默认流程为**预览 → 用户明确确认 → 发布 → 返回链接**，用户提供的文字保持原样。支持使用 **X 自带的预排期** 定时发帖，由 X 服务器到时发布，电脑可以关机。
 
-插件运行一个零依赖的 Node.js ≥ 22 MCP stdio 服务器，名称为 `x-poster`，启动命令为 `node server/index.mjs`。服务器通过 Chrome DevTools Protocol（CDP）操作专用浏览器 profile，提供推文、预排期和 Markdown 长文章的十个工具（见工具参考）。仓库根目录同时是两种宿主的插件根目录和市场根目录；两种宿主共用 `skills/x-poster/SKILL.md` 和默认数据目录 `~/.x-poster`，登录一次即可共用会话。
+插件运行一个零依赖的 Node.js ≥ 22 MCP stdio 服务器，名称为 `x-poster`，启动命令为 `node server/index.mjs`。服务器通过 Chrome DevTools Protocol（CDP）操作专用浏览器 profile，提供推文、预排期和 Markdown 长文章的十一个工具（见工具参考）。仓库根目录同时是两种宿主的插件根目录和市场根目录；两种宿主共用 `skills/x-poster/SKILL.md` 和默认数据目录 `~/.x-poster`，登录一次即可共用会话。
 
 ## ⚠️ 风险
 
@@ -130,6 +130,7 @@ agent 先调用 `x_status`，必要时引导用户登录；准备文字和本地
 | `x_list_scheduled` | 无 | 返回按时间排序的 `scheduled` 和 `count`；每项含 `id`、`scheduled_at`、`text`、`media_count`、`state`（未知时为 `null`）。 |
 | `x_cancel_scheduled` | `id`（纯数字字符串） | 取消一个用户已明确确认的预排期帖；成功返回 `deleted: true`、`id` 和剩余数量 `remaining`，取消不计入发布额度。 |
 | `x_article_draft` | `markdown_path`（绝对路径）、`title?`、`cover?`（绝对路径） | 从 Markdown 新建文章草稿，返回 `article_id`、`edit_url`、标题、图片实际／预期数量、封面状态、字数文字、截图路径与图像、`warnings` 和 `next_step`；不会修改已有草稿。 |
+| `x_article_cover` | `article_id`（纯数字字符串）、`cover`（绝对路径，支持 `~`） | 为用户指定的已有草稿添加或替换封面，返回 `article_id`、`edit_url`、`replaced`、`cover: true`、截图路径与图像；不发布、不修改正文、不写历史、不占发布额度。 |
 | `x_article_publish` | `article_id`（纯数字字符串） | 发布用户明确确认的这份草稿，返回 `article_id`，能确定链接时返回 `url`；计入发布限制。 |
 | `x_article_delete` | `article_id`（纯数字字符串） | 删除用户明确确认的草稿，核验删除响应和列表后返回 `deleted: true`；不计入发布限制。 |
 
@@ -137,7 +138,7 @@ agent 先调用 `x_status`，必要时引导用户登录；准备文字和本地
 
 ## 文章
 
-X Articles 是 `https://x.com/compose/articles` 的长文章编辑器，需要**具备文章权限的 X Premium 账号**；没有新建入口时返回 `ARTICLES_UNAVAILABLE`。文章始终采用 **新建草稿 → 用户审阅截图或 `edit_url` → 明确确认该 `article_id` → 发布**。草稿就是预览，不会公开；只要草稿时到此停止。不要把草稿截图当作发布成功。
+X Articles 是 `https://x.com/compose/articles` 的长文章编辑器，需要**具备文章权限的 X Premium 账号**；没有新建入口时返回 `ARTICLES_UNAVAILABLE`。新文章采用 **新建草稿 → 用户审阅截图或 `edit_url` → 明确确认该 `article_id` → 发布**。草稿就是预览，不会公开；只要草稿时到此停止。不要把草稿截图当作发布成功。
 
 提供本地 `.md` 文件，最多 1 MB，正文不能为空，正文图片最多 50 张。标题优先级是工具／CLI 参数 `title` → front matter `title:` → 首个 `# ` 标题；首个 `# ` 标题会从正文移除。可选 front matter 使用简单的 `key: value`（支持成对引号），不支持完整 YAML：
 
@@ -173,6 +174,20 @@ cover: ./images/封面.webp
 `---` / `***` 分割线会跳过，围栏代码块和表格降级为普通段落，原始 HTML 按文字转义；这些情况会返回 `warnings`。请在发布前核对警告与排版。封面可用 front matter `cover:`（相对 `.md` 目录），或参数 `cover`（MCP 为绝对路径、CLI 可相对路径）覆盖；封面支持 jpg、jpeg、png、webp，最多 5 MB。
 
 更改内容时可以在 X 打开 `edit_url` 手动编辑，或明确确认后用 `x_article_delete` 删除刚创建的草稿，再从修改后的 Markdown 新建。只删除本会话创建的草稿，或用户明确提供 id 并确认的草稿；绝不自动改动其他草稿。创建和删除草稿不占发布额度；文章发布与推文共用额度，删除不会退还发布额度。遇到 `UNCERTAIN` 不要重试，请检查 `edit_url` 和文章列表的“草稿／已发布”标签。
+
+### 为已有草稿添加或替换封面
+
+`x_article_cover`、`x_article_publish` 和 `x_article_delete` 仅适用于草稿。
+
+使用 `x_article_cover({ article_id: "123", cover: "/绝对路径/cover.png" })`，目标必须是用户指定的草稿；不必为了换封面重建草稿。MCP 路径须为绝对路径（支持 `~/`），CLI 可使用相对路径：
+
+```bash
+node server/cli.mjs article-cover --id '123' --cover ./cover.png
+```
+
+封面推荐 **5:2** 比例，支持 **jpg（含 jpeg）、png、webp**，最多 5 MB，不支持 GIF。X 会弹出裁剪对话框，x-poster 点击“应用”使用默认裁剪。工具等待媒体处理完成及本次 `ArticleEntityUpdateCoverMedia` 的 HTTP 200 成功响应，再核验封面并截图；成功响应也必须没有 GraphQL 错误。请向用户展示返回的截图及 `edit_url`，`replaced` 表示此前是否已有封面。此操作不发布、不修改正文、不写入历史，也不占发布额度，无需 Codex 发布审批。
+
+60 秒内没有封面保存响应，或响应含 GraphQL 错误时返回 `UNCERTAIN`，附 `article_id` 和 `edit_url`；请用户检查草稿，不要自动重试。裁剪未完成或媒体处理超时返回 `UPLOAD_FAILED`。
 
 ## 配置
 
@@ -222,6 +237,7 @@ codex
 | `scheduled` | 列出预排期帖子。 |
 | `cancel --id <id>` | 取消一个预排期帖；先列出并向用户确认准确文字和时间。 |
 | `article-draft --file <md> [--title "…"] [--cover <img>]` | 新建文章草稿并截图；文件和封面允许相对路径。 |
+| `article-cover --id <id> --cover <image>` | 为已有草稿添加或替换封面并截图；封面允许相对路径，不发布。 |
 | `article-publish --id <id>` | 审阅截图或 `edit_url` 并明确确认后，发布这个文章草稿。 |
 | `article-delete --id <id>` | 明确确认后删除指定草稿。 |
 
@@ -245,7 +261,7 @@ node server/cli.mjs article-publish --id '<article_id>'
 node server/cli.mjs article-delete --id '<article_id>'
 ```
 
-CLI 会把 `--text` 中字面的 `\n` 转为换行，并允许相对图片路径；多图重复 `--image`。纯图片可省略 `--text`。CLI `post`、`schedule`、`cancel`、`article-publish`、`article-delete` 直接执行指定操作，没有 agent 的预览确认对话或 Codex 的工具审批，请在执行前核对内容和 id。文章必须先新建草稿并由用户确认。
+CLI 会把 `--text` 中字面的 `\n` 转为换行，并允许相对图片路径；多图重复 `--image`。纯图片可省略 `--text`。CLI `post`、`schedule`、`cancel`、`article-publish`、`article-delete` 直接执行指定操作，没有 agent 的预览确认对话或 Codex 的工具审批，请在执行前核对内容和 id。新文章发布前必须先新建草稿并由用户确认；已有草稿可直接使用 `article-cover` 更换封面。
 
 ## 数据与安全
 

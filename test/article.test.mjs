@@ -3,13 +3,13 @@ import { performance } from 'node:perf_hooks';
 import assert from 'node:assert/strict';
 import { runInNewContext } from 'node:vm';
 import { mkdtemp, readFile, writeFile, truncate, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { createArticleDraft, publishArticle, deleteArticleDraft, ARTICLE_SELECTORS as S } from '../server/article.mjs';
+import { tmpdir, homedir } from 'node:os';
+import { join, relative } from 'node:path';
+import { createArticleDraft, setArticleCover, publishArticle, deleteArticleDraft, ARTICLE_SELECTORS as S } from '../server/article.mjs';
 import { Browser } from '../server/chrome.mjs';
 import { XPosterError } from '../server/errors.mjs';
 import { config } from '../server/config.mjs';
-import { articleDraft, articlePublish, articleDelete, callTool } from '../server/tools.mjs';
+import { articleDraft, articleCover, articlePublish, articleDelete, callTool } from '../server/tools.mjs';
 import { readHistory, checkRateLimit } from '../server/limits.mjs';
 
 const test = (name, fn) => nodeTest(name, { timeout: 5000 }, fn);
@@ -36,7 +36,7 @@ function fixture(options = {}) {
     value: '', placeholder: '', getAttribute: name => attrs[name] ?? null,
     setAttribute(name, value) { tagged.set(`[${name}="${value}"]`, this); },
     focus() { state.focus = kind; }, closest(selector) { return kind === 'coverInput' && selector === S.dialog ? null : null; },
-    scrollIntoView() {}, querySelector() { return null; }, querySelectorAll() { return []; },
+    contains(other) { return other === this; }, scrollIntoView() {}, querySelector() { return null; }, querySelectorAll() { return []; },
     getBoundingClientRect() {
       const index = state.rectReads[kind] ?? 0;
       state.rectReads[kind] = index + 1;
@@ -70,13 +70,42 @@ function fixture(options = {}) {
   Object.defineProperty(dialog, 'innerText', { get: () => state.uploadError ?? '插入' });
   const coverInput = element('coverInput');
   const coverButton = element('coverButton');
+  const coverArea = element('coverArea');
+  const coverMedia = element('coverMedia');
+  coverMedia.tagName = 'IMG';
+  Object.defineProperties(coverMedia, {
+    complete: { get: () => state.coverComplete ?? Date.now() >= (state.coverReadyAt ?? 0) },
+    naturalWidth: { get: () => state.coverNaturalWidth ?? 1200 },
+  });
+  coverMedia.getBoundingClientRect = () => ({ width: state.coverWidth ?? 1200 });
+  const extraCoverImages = (state.extraCoverImages ?? []).map(scope => ({
+    tagName: 'IMG', complete: true, naturalWidth: 1200,
+    getBoundingClientRect: () => ({ width: scope === 'thumbnail' ? 32 : 1200 }),
+    closest: selector => scope === 'body' && selector === S.composer ? composer
+      : scope === 'dialog' && selector === S.dialog ? dialog : null,
+  }));
+  coverMedia.closest = selector => state.mediaInBody && selector === S.composer ? composer
+    : state.mediaInDialog && selector === S.dialog ? dialog : null;
+  coverArea.querySelectorAll = selector => selector === 'img, video' ? [...extraCoverImages, ...(state.cover ? [coverMedia] : [])] : [];
+  const editorArea = element('editorArea');
+  editorArea.contains = other => other === composer;
+  editorArea.querySelectorAll = () => [element('avatar')];
+  coverArea.parentElement = editorArea;
+  coverInput.parentElement = coverButton.parentElement = coverArea;
+  // The cover is a sibling of the persistent change-cover button.
   const cancelUpload = element('cancelUpload', state.english ? 'Cancel upload' : '取消上传');
+  const reader = element('reader');
+  const unpublish = element('unpublish', state.english ? 'Unpublish' : '取消发布，移至草稿');
+  reader.querySelectorAll = () => state.published ? [unpublish] : [];
+  Object.defineProperty(reader, 'innerText', { get: () => state.published
+    ? state.english ? 'Published\nUnpublish' : '已发布\n取消发布，移至草稿' : state.text });
   const document = {
     querySelector(selector) {
       if (tagged.has(selector)) return tagged.get(selector);
       if (selector === S.menuItem) return state.menu ? media : null;
       if (selector === S.create) return state.create ? element('create') : null;
-      if (selector === S.composer) return state.pathname.includes('/edit/') ? composer : null;
+      if (selector === S.composer) return state.pathname.includes('/edit/') && !state.published && !state.editorMissing ? composer : null;
+      if (selector === 'main, [role=main]') return reader;
       if (selector === S.dialog) return state.dialog ? dialog : null;
       if (selector === S.confirm) return state.dialog === 'delete' || state.sheetConfirm && state.dialog === 'publish' ? confirm : null;
       if (selector === S.mediaInput) return state.dialog === 'media' ? element('mediaInput') : null;
@@ -87,29 +116,30 @@ function fixture(options = {}) {
       return null;
     },
     querySelectorAll(selector) {
-      if (selector === 'textarea') return [title];
-      if (selector === 'button') return [sidebarMore, publish, more, ...(state.cancelUpload ? [cancelUpload] : [])];
+      if (selector === 'textarea') return state.published || state.editorMissing ? [] : [title];
+      if (selector === 'button') return [sidebarMore, publish, more, ...(state.leftPublished ? [unpublish] : []), ...(state.cancelUpload ? [cancelUpload] : [])];
       if (selector === S.menuItem) return state.menu ? [media, remove].filter(el => !state.hideActions?.includes(el.kind)) : [];
       if (selector === S.dialog) return state.dialog ? [dialog] : [];
-      if (selector === S.fileInput) return [coverInput];
+      if (selector === S.fileInput) return state.missingCoverInput ? [] : [coverInput];
+      if (selector === S.cover) return [coverButton];
       return [];
     },
     body: {},
   };
-  Object.defineProperty(document.body, 'innerText', { get: () => `发布\n${state.saved}\n${state.text.length} 个字\n${state.processingText}` });
-  coverButton.querySelector = () => state.cover ? {} : null;
+  Object.defineProperty(document.body, 'innerText', { get: () => `发布\n${state.saved}\n${state.text.length} 个字\n${state.processingText}\n${state.leftPublished ? '已发布 Published 其他已发布文章' : ''}` });
   class DataTransfer { values = {}; setData(type, value) { this.values[type] = value; } }
   class ClipboardEvent { constructor(type, options) { Object.assign(this, options); } }
   const page = {
-    async navigate(url) { calls.push(['navigate', url]); state.pathname = new URL(url).pathname; if (state.pathname.includes('/edit/')) state.title ||= 'Existing'; },
+    async navigate(url) { calls.push(['navigate', url]); state.pathname = state.redirect ?? new URL(url).pathname; if (state.pathname.includes('/edit/')) state.title ||= 'Existing'; if (state.oldCoverResponse) response('ArticleEntityUpdateCoverMedia'); },
     async call(fn, ...args) {
       return runInNewContext(`(${fn.toString()})(...args)`, { args, document, location: state, DataTransfer, ClipboardEvent,
-        window: { scrollTo() {} }, Node: { DOCUMENT_POSITION_FOLLOWING: 4 } });
+        window: { scrollTo(...args) { calls.push(['scroll', ...args]); } }, Node: { DOCUMENT_POSITION_FOLLOWING: 4 } });
     },
     async waitFor(fn, args = [], waitOptions = {}) {
       calls.push(['waitFor', waitOptions.timeout]);
       for (let i = 0; i < 3; i++) {
         const result = await this.call(fn, ...args);
+        calls.push(['waitResult', result]);
         if (result) return result;
         if (state.pendingImages && !state.uploadError) {
           state.images += state.pendingImages; state.pendingImages = 0; state.dialog = null; state.imagePolls++;
@@ -124,7 +154,7 @@ function fixture(options = {}) {
       return null;
     },
     async click(selector) {
-      const kind = tagged.get(selector)?.kind ?? ({ [S.create]: 'create', [S.insert]: 'insert', [S.confirm]: 'confirm' })[selector];
+      const kind = tagged.get(selector)?.kind ?? ({ [S.create]: 'create', [S.insert]: 'insert', [S.confirm]: 'confirm', [S.cover]: 'coverButton' })[selector];
       calls.push(['click', kind ?? selector]);
       if (state.coveredClicks?.[kind] > 0) {
         state.coveredClicks[kind]--;
@@ -139,7 +169,27 @@ function fixture(options = {}) {
       if (kind === 'create') { state.pathname = '/compose/articles/edit/123'; state.title = ''; }
       if (kind === 'insert' || kind === 'more') state.menu = true;
       if (kind === 'media') { state.menu = false; state.dialog = 'media'; }
-      if (kind === 'apply') { state.dialog = null; state.cover = true; if (!state.noSave) response('ArticleEntityUpdateCover'); }
+      if (kind === 'coverButton' && !state.noChooser) {
+        const opened = () => emit('Page.fileChooserOpened', { backendNodeId: 42 });
+        if (state.chooserDelay) setTimeout(opened, state.chooserDelay);
+        else opened();
+      }
+      if (kind === 'apply') {
+        if (!state.cropStuck) state.dialog = null;
+        state.cover = !state.noCover;
+        state.coverReadyAt = Date.now() + (state.coverLoadDelay ?? 0);
+        state.mediaInBody = state.mediaInDialog = false;
+        if (state.processingStages) Object.assign(state, state.processingStages[0]);
+        if (!state.noSave) {
+          const save = () => {
+            calls.push(['coverResponse', Date.now()]);
+            response(state.coverOperation ?? 'ArticleEntityUpdateCoverMedia', state.coverBody ?? { data: { ok: true } },
+              { articleEntityId: state.coverId ?? '123' }, state.coverStatus ?? 200);
+          };
+          if (state.coverDelay) setTimeout(save, state.coverDelay);
+          else save();
+        }
+      }
       if (kind === 'publish') {
         if (state.confirmPublish) state.dialog = 'publish';
         else if (!state.noPublish) response('ArticleEntityPublish', state.publishBody ?? { data: { article_entity_publish: { article_results: { result: { rest_id: '123' } } } } }, state.publishVariables ?? { articleEntityId: '123' }, state.publishStatus ?? 200);
@@ -163,11 +213,13 @@ function fixture(options = {}) {
       else state.dialog = 'crop';
     },
     async send(method, params) {
+      calls.push(['send', method, params]);
+      if (method === 'DOM.setFileInputFiles') state.dialog = 'crop';
       if (method === 'Network.getResponseBody') return { body: JSON.stringify(bodies.get(params.requestId)), base64Encoded: false };
       return {};
     },
     on(method, handler) { if (!handlers.has(method)) handlers.set(method, new Set()); handlers.get(method).add(handler); return () => handlers.get(method).delete(handler); },
-    async screenshot() { return Buffer.from('mock PNG'); },
+    async screenshot() { calls.push(['screenshot', Date.now()]); return Buffer.from('mock PNG'); },
     async close() { state.closed = true; },
   };
   return { page, browser: { newPage: async () => page }, state, calls, response,
@@ -376,19 +428,22 @@ test('uncertain article publication is counted once and not retried', async t =>
 
 test('articles check login and close the browser without navigating when logged out', async t => {
   const f = await toolFixture(t, { loggedOut: true });
-  for (const action of [() => articleDraft({ markdown_path: f.markdown_path }), () => articlePublish({ article_id: '123' }), () => articleDelete({ article_id: '123' })]) {
+  const cover = join(f.dir, 'cover.png');
+  await writeFile(cover, 'image');
+  for (const action of [() => articleDraft({ markdown_path: f.markdown_path }), () => articleCover({ article_id: '123', cover }), () => articlePublish({ article_id: '123' }), () => articleDelete({ article_id: '123' })]) {
     await assert.rejects(action(), error => error.code === 'NOT_LOGGED_IN');
   }
   assert.equal(f.calls.length, 0);
   assert.equal(f.state.browserClosed, true);
 });
 
-test('article publish and delete require Codex tool approval while draft does not', async () => {
+test('article publish and delete require Codex tool approval while draft and cover do not', async () => {
   const configuration = JSON.parse(await readFile(new URL('../.codex-mcp.json', import.meta.url), 'utf8'));
   const tools = configuration.mcpServers['x-poster'].tools;
   assert.equal(tools.x_article_publish.approval_mode, 'prompt');
   assert.equal(tools.x_article_delete.approval_mode, 'prompt');
   assert.equal(tools.x_article_draft, undefined);
+  assert.equal(tools.x_article_cover, undefined);
 });
 
 test('autosave waits for the last content request and a full three-second quiet period', async t => {
@@ -570,4 +625,240 @@ test('virtual clock drives operations past 200 I/O turns and resets after succes
   assert.equal(Date, originalDate);
   assert.equal(setTimeout, originalTimeout);
   assert.equal(await runClock(t, () => 'usable again'), 'usable again');
+});
+
+test('existing draft cover waits for settled Apply, processing and a fresh CoverMedia save', async t => {
+  for (const cover of [false, true]) {
+    const f = fixture({ cover, title: 'Original title', text: 'Original body', images: 2, english: cover,
+      rects: { apply: [0, 20, 20] }, coverDelay: 2000, processingStages: [
+        { processingText: cover ? 'Processing media…' : '正在处理媒体…', cancelUpload: false },
+        { processingText: '', cancelUpload: true }, { processingText: '', cancelUpload: false },
+      ] });
+    const args = await input(t, { cover: '/tmp/cover.png' });
+    const result = await runClock(t, () => setArticleCover(f.browser, '123', args));
+    assert.equal(result.article_id, '123');
+    assert.equal(result.edit_url, 'https://x.com/compose/articles/edit/123');
+    assert.equal(result.replaced, cover);
+    assert.equal(result.cover, true);
+    assert.deepEqual(result.screenshot, await readFile(args.screenshotPath));
+    const reads = f.calls.filter(call => call[0] === 'rect' && call[1] === 'apply');
+    assert.deepEqual(reads.map(call => call[2]), [0, 20, 20]);
+    assert.equal(reads[2][3] - reads[1][3], 150);
+    assert.equal(f.calls.find(call => call[0] === 'clicked' && call[1] === 'apply')[2], reads[2][3]);
+    assert.equal(f.calls.filter(call => call[0] === 'files').length, 1);
+    assert.equal(f.state.processingIndex, 2);
+    assert.ok(f.calls.find(call => call[0] === 'screenshot')[1] >= f.calls.find(call => call[0] === 'coverResponse')[1]);
+    assert.deepEqual(f.calls.filter(call => call[0] === 'scroll'), [['scroll', 0, 0]]);
+    assert.equal(f.state.title, 'Original title');
+    assert.equal(f.state.text, 'Original body');
+    assert.equal(f.state.images, 2);
+    assert.equal(f.calls.some(call => call[0] === 'press' || call[0] === 'click' && call[1] !== 'apply'), false);
+    assert.equal(f.state.closed, true);
+    assert.equal(f.listenerCount(), 0);
+  }
+});
+
+test('existing cover without input uses intercepted file chooser and cleans it up', async t => {
+  const f = fixture({ cover: true, missingCoverInput: true, chooserDelay: 200 });
+  const args = await input(t, { cover: '/tmp/replacement.webp' });
+  const result = await runClock(t, () => setArticleCover(f.browser, '123', args));
+  assert.equal(result.replaced, true);
+  assert.equal(result.cover, true);
+  const sends = f.calls.filter(call => call[0] === 'send');
+  assert.deepEqual(sends.filter(call => call[1] === 'Page.setInterceptFileChooserDialog').map(call => call[2]),
+    [{ enabled: true }, { enabled: false }]);
+  assert.deepEqual(sends.find(call => call[1] === 'DOM.setFileInputFiles')[2], { backendNodeId: 42, files: [args.cover] });
+  assert.equal(f.calls.some(call => call[0] === 'files'), false);
+  assert.equal(f.listenerCount(), 0);
+  assert.equal(f.state.closed, true);
+});
+
+test('cover save requires fresh matching CoverMedia 200 without GraphQL errors', async t => {
+  const args = await input(t, { cover: '/tmp/cover.png' });
+  for (const options of [{ noSave: true }, { noSave: true, oldCoverResponse: true },
+    { coverOperation: 'ArticleEntityUpdateContent' }, { coverId: '999' }, { coverStatus: 500 },
+    { coverBody: { data: { ok: true }, errors: [{ message: 'denied' }] } }]) {
+    const f = fixture(options);
+    await runClock(t, async () => {
+      const start = Date.now();
+      await assert.rejects(setArticleCover(f.browser, '123', args), error => {
+        assert.equal(error.code, 'UNCERTAIN');
+        assert.equal(error.details.article_id, '123');
+        assert.equal(error.details.edit_url, 'https://x.com/compose/articles/edit/123');
+        return true;
+      });
+      if (options.noSave) assert.equal(Date.now() - start, 60150);
+    });
+    assert.equal(f.listenerCount(), 0);
+    assert.equal(f.state.closed, true);
+  }
+});
+
+test('cover failures close pages, stop watchers and never publish', async t => {
+  const args = await input(t, { cover: '/tmp/cover.png' });
+  for (const [options, code] of [[{ cropStuck: true }, 'UPLOAD_FAILED'],
+    [{ redirect: '/compose/articles' }, 'INVALID_INPUT'], [{ redirect: '/compose/articles/edit/999' }, 'INVALID_INPUT'],
+    [{ missingCoverInput: true }, 'UI_CHANGED'], [{ cover: true, missingCoverInput: true, noChooser: true }, 'UPLOAD_FAILED'],
+    [{ processingStages: Array(4).fill({ processingText: '正在处理媒体', cancelUpload: true }) }, 'UPLOAD_FAILED']]) {
+    const f = fixture(options);
+    await assert.rejects(runClock(t, () => setArticleCover(f.browser, '123', args)), error => error.code === code);
+    assert.equal(f.listenerCount(), 0);
+    assert.equal(f.state.closed, true);
+    assert.equal(f.calls.some(call => call[0] === 'click' && call[1] === 'publish'), false);
+    if (options.noChooser) assert.ok(f.calls.some(call => call[1] === 'Page.setInterceptFileChooserDialog' && !call[2].enabled));
+    if (options.redirect) assert.equal(f.calls.some(call => call[0] === 'files'), false);
+  }
+});
+
+test('cover MCP rejects invalid id, path, format, size and missing files before opening Chrome', async t => {
+  const f = await toolFixture(t);
+  const cover = join(f.dir, 'cover.png');
+  await writeFile(cover, 'image');
+  for (const args of [undefined, null, [], {}, { article_id: 'bad', cover }, { article_id: '123\n', cover },
+    { article_id: 123, cover }, { article_id: '123', cover: 'relative.png' }, { article_id: '123', cover: join(f.dir, 'cover.gif') },
+    { article_id: '123', cover: join(f.dir, 'missing.png') }, { article_id: '123', cover: f.dir },
+    { article_id: '123', cover, extra: true }, { article_id: '123' }]) {
+    const result = await callTool('x_article_cover', args);
+    assert.equal(JSON.parse(result.content[0].text).code, 'INVALID_INPUT');
+  }
+  await truncate(cover, 5 * 1024 * 1024 + 1);
+  await assert.rejects(articleCover({ article_id: '123', cover }), error => error.code === 'INVALID_INPUT');
+  assert.equal(f.opened.mock.callCount(), 0);
+});
+
+test('cover MCP returns image content without changing history or consuming limits', async t => {
+  const f = await toolFixture(t, { cover: true });
+  const cover = join(f.dir, 'cover.png');
+  await writeFile(cover, 'image');
+  const history = `${JSON.stringify({ ts: new Date().toISOString(), article_id: '999' })}\n`;
+  await writeFile(config.historyFile, history);
+  const result = await runClock(t, () => callTool('x_article_cover', { article_id: '123', cover }));
+  assert.equal(result.isError, undefined);
+  const data = JSON.parse(result.content[0].text);
+  assert.equal(data.replaced, true);
+  assert.equal(data.cover, true);
+  assert.equal(result.content[1].type, 'image');
+  assert.equal((await readFile(data.screenshot)).toString('base64'), result.content[1].data);
+  assert.equal(await readFile(config.historyFile, 'utf8'), history);
+  assert.equal(f.state.browserClosed, true);
+});
+
+
+test('cover detection ignores body, dialog and unrelated editor images', async t => {
+  const args = await input(t, { cover: '/tmp/cover.png' });
+  for (const options of [{ cover: false, images: 3 }, { cover: true, mediaInBody: true }, { cover: true, mediaInDialog: true }]) {
+    const f = fixture(options);
+    const result = await runClock(t, () => setArticleCover(f.browser, '123', args));
+    assert.equal(result.replaced, false);
+    assert.equal(result.cover, true);
+  }
+});
+
+test('cover MCP expands home paths and accepts the 5 MB boundary', async t => {
+  const f = await toolFixture(t);
+  const cover = join(f.dir, 'cover.JPEG');
+  await writeFile(cover, 'image');
+  await truncate(cover, 5 * 1024 * 1024);
+  const result = await runClock(t, () => articleCover({ article_id: '123', cover: `~/${relative(homedir(), cover)}` }));
+  assert.equal(result.data.cover, true);
+  assert.deepEqual(f.calls.find(call => call[0] === 'files')[2], [cover]);
+});
+
+test('uncertain cover MCP and screenshot failures keep history unchanged and include the draft id', async t => {
+  const f = await toolFixture(t, { noSave: true });
+  const cover = join(f.dir, 'cover.png');
+  await writeFile(cover, 'image');
+  const result = await runClock(t, () => callTool('x_article_cover', { article_id: '123', cover }));
+  assert.equal(result.isError, true);
+  const failure = JSON.parse(result.content[0].text);
+  assert.equal(failure.code, 'UNCERTAIN');
+  assert.equal(failure.article_id, '123');
+  assert.equal(failure.edit_url, 'https://x.com/compose/articles/edit/123');
+  assert.deepEqual(await readHistory(config.historyFile), []);
+  assert.equal(f.state.browserClosed, true);
+  const direct = fixture();
+  await assert.rejects(runClock(t, () => setArticleCover(direct.browser, '123', { cover, screenshotPath: f.dir })),
+    error => error.code === 'UNCERTAIN' && error.details.article_id === '123');
+  assert.equal(direct.state.closed, true);
+  assert.equal(direct.listenerCount(), 0);
+});
+
+
+test('cover screenshots wait for the large image to load for new and existing drafts', async t => {
+  const args = await input(t, { cover: '/tmp/cover.png' });
+  for (const create of [false, true]) {
+    const f = fixture({ coverLoadDelay: 5000, extraCoverImages: ['body', 'dialog', 'thumbnail'] });
+    const result = await runClock(t, () => create ? createArticleDraft(f.browser, args) : setArticleCover(f.browser, '123', args));
+    assert.equal(result.cover, true);
+    assert.equal(result.warning, undefined);
+    assert.ok(f.calls.find(call => call[0] === 'screenshot')[1] >= f.state.coverReadyAt);
+    assert.equal(f.state.closed, true);
+    assert.equal(f.listenerCount(), 0);
+  }
+});
+
+test('cover image load timeout still returns a successful screenshot with a warning', async t => {
+  const args = await input(t, { cover: '/tmp/cover.png' });
+  for (const create of [false, true]) for (const imageState of [{ coverComplete: false }, { coverNaturalWidth: 0 }, { noCover: true }]) {
+    const f = fixture({ ...imageState, extraCoverImages: imageState.noCover ? ['body', 'dialog'] : ['body', 'dialog', 'thumbnail'] });
+    const result = await runClock(t, () => create ? createArticleDraft(f.browser, args) : setArticleCover(f.browser, '123', args));
+    assert.equal(result.cover, true);
+    assert.match(result.warning, /截图.*封面/);
+    assert.deepEqual(result.screenshot, await readFile(args.screenshotPath));
+    const savedAt = f.calls.find(call => call[0] === 'coverResponse')[1];
+    const screenshotAt = f.calls.find(call => call[0] === 'screenshot')[1];
+    assert.equal(screenshotAt - savedAt, create ? 23000 : 20000);
+    assert.equal(f.state.closed, true);
+    assert.equal(f.listenerCount(), 0);
+  }
+});
+
+test('MCP preserves cover-image timeout warnings for cover updates and draft creation', async t => {
+  const f = await toolFixture(t, { coverComplete: false });
+  const cover = join(f.dir, 'cover.png');
+  await writeFile(cover, 'image');
+  for (const [tool, args] of [['x_article_cover', { article_id: '123', cover }],
+    ['x_article_draft', { markdown_path: f.markdown_path, cover }]]) {
+    const result = await runClock(t, () => callTool(tool, args));
+    assert.equal(result.isError, undefined);
+    const data = JSON.parse(result.content[0].text);
+    assert.equal(data.ok, true);
+    assert.match(data.warning, /截图.*封面/);
+    assert.equal(result.content[1].type, 'image');
+  }
+});
+
+test('published articles reject cover, publish and delete immediately without any clicks', async t => {
+  const args = await input(t, { cover: '/tmp/cover.png' });
+  for (const english of [false, true]) {
+    for (const [action, message] of [
+      [browser => setArticleCover(browser, '123', args), '该文章已发布，x_article_cover 只能用于草稿。如需更换已发布文章的封面，请让用户在 X 网页上操作。'],
+      [browser => publishArticle(browser, '123'), '该文章已发布。'],
+      [browser => deleteArticleDraft(browser, '123'), '该文章已发布，x_article_delete 只删除草稿。'],
+    ]) {
+      const f = fixture({ published: true, english });
+      await assert.rejects(runClock(t, () => action(f.browser)), error => {
+        assert.equal(error.code, 'INVALID_INPUT');
+        assert.equal(error.message, message);
+        assert.equal(error.details.article_id, '123');
+        assert.equal(error.details.edit_url, 'https://x.com/compose/articles/edit/123');
+        return true;
+      });
+      assert.equal(f.calls.filter(call => call[0] === 'waitResult').length, 1);
+      assert.equal(f.calls.some(call => call[0] === 'click' || call[0] === 'press' || call[0] === 'files'), false);
+      assert.equal(f.state.closed, true);
+      assert.equal(f.listenerCount(), 0);
+    }
+  }
+});
+
+test('left-list Published text does not classify a draft or a loading editor as published', async t => {
+  const args = await input(t, { cover: '/tmp/cover.png' });
+  for (const action of [browser => setArticleCover(browser, '123', args),
+    browser => publishArticle(browser, '123'), browser => deleteArticleDraft(browser, '123')]) {
+    const f = fixture({ leftPublished: true });
+    await runClock(t, () => action(f.browser));
+  }
+  const loading = fixture({ leftPublished: true, editorMissing: true });
+  await assert.rejects(runClock(t, () => setArticleCover(loading.browser, '123', args)), error => error.code === 'UI_CHANGED');
 });

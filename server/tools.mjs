@@ -1,13 +1,13 @@
 import { mkdir, readdir, stat, unlink, open } from 'node:fs/promises';
 import { join, dirname, isAbsolute, extname } from 'node:path';
 import { Browser, findChrome, openPlainWindow } from './chrome.mjs';
-import { config, ensureHome, loadState, saveState } from './config.mjs';
+import { config, ensureHome, loadState, saveState, expandHome } from './config.mjs';
 import { XPosterError } from './errors.mjs';
 import { appendHistory, checkRateLimit, readHistory } from './limits.mjs';
 import { MAX_WEIGHTED_LENGTH, validatePostInput, parseScheduledAt } from './validate.mjs';
 import { compose, listScheduled as readScheduled, cancelScheduled as deleteScheduled, URLS } from './x.mjs';
 import { parseArticleMarkdown, MAX_MARKDOWN_BYTES } from './markdown.mjs';
-import { createArticleDraft, publishArticle, deleteArticleDraft } from './article.mjs';
+import { createArticleDraft, setArticleCover, publishArticle, deleteArticleDraft } from './article.mjs';
 
 let queue = Promise.resolve();
 export function exclusive(fn) {
@@ -287,12 +287,24 @@ export function cancelScheduled(args) {
   });
 }
 
-function articleIdInput(args) {
+function articleIdInput(args, extraKeys = []) {
   if (!args || typeof args !== 'object' || Array.isArray(args) || typeof args.article_id !== 'string'
-    || !args.article_id || /\D/.test(args.article_id) || Object.keys(args).some(key => key !== 'article_id')) {
+    || !args.article_id || /\D/.test(args.article_id) || Object.keys(args).some(key => key !== 'article_id' && !extraKeys.includes(key))) {
     throw new XPosterError('INVALID_INPUT', 'article_id 必须是文章的纯数字字符串。');
   }
   return args.article_id;
+}
+
+async function articleCoverInput(args) {
+  const articleId = articleIdInput(args, ['cover']);
+  if (typeof args.cover !== 'string' || !isAbsolute(expandHome(args.cover))) {
+    throw new XPosterError('INVALID_INPUT', '文章 cover 必须是本地图片的绝对路径（支持 ~/）。');
+  }
+  if (!['.jpg', '.jpeg', '.png', '.webp'].includes(extname(args.cover).toLowerCase())) {
+    throw new XPosterError('INVALID_INPUT', '文章封面仅支持 jpg、jpeg、png、webp 格式。');
+  }
+  const { images } = await validatePostInput({ images: [args.cover] });
+  return { articleId, cover: images[0] };
 }
 
 async function articleDraftInput(args) {
@@ -335,7 +347,8 @@ async function articleDraftInput(args) {
 }
 
 async function runArticle(args, mode) {
-  const input = mode === 'draft' ? await articleDraftInput(args) : { articleId: articleIdInput(args) };
+  const input = mode === 'draft' ? await articleDraftInput(args)
+    : mode === 'cover' ? await articleCoverInput(args) : { articleId: articleIdInput(args) };
   return exclusive(async () => {
     requireUserWindowClosed();
     if (mode === 'publish') {
@@ -344,7 +357,7 @@ async function runArticle(args, mode) {
         retry_after_sec: rate.retryAfterSec, posts_last_24h: rate.postsLast24h, hint: '请告诉用户等待时间，不要循环重试。',
       });
     }
-    if (mode === 'draft') await preparePreviews();
+    if (mode === 'draft' || mode === 'cover') await preparePreviews();
     const browser = await openBrowser(config.headless);
     try {
       if (!await browser.isLoggedIn()) throw new XPosterError('NOT_LOGGED_IN', '尚未登录 X。', {
@@ -356,6 +369,11 @@ async function runArticle(args, mode) {
         return { data: { ok: true, ...result, screenshot: screenshotPath, warnings: input.warnings,
           next_step: '已创建新草稿，尚未发布。请向用户展示截图、标题、warnings 和 edit_url；用户也可打开 edit_url 审阅。仅在用户明确确认这一 article_id 后调用 x_article_publish。用户只要草稿时到此停止。',
         }, image: screenshot };
+      }
+      if (mode === 'cover') {
+        const screenshotPath = join(config.previewsDir, `${new Date().toISOString().replace(/[:.]/g, '-')}-article-cover.png`);
+        const { screenshot, ...result } = await setArticleCover(browser, input.articleId, { cover: input.cover, screenshotPath });
+        return { data: { ok: true, ...result, screenshot: screenshotPath }, image: screenshot };
       }
       let result;
       try {
@@ -383,6 +401,7 @@ async function runArticle(args, mode) {
 }
 
 export function articleDraft(args) { return runArticle(args, 'draft'); }
+export function articleCover(args) { return runArticle(args, 'cover'); }
 export function articlePublish(args) { return runArticle(args, 'publish'); }
 export function articleDelete(args) { return runArticle(args, 'delete'); }
 
@@ -466,6 +485,15 @@ export const TOOLS = [
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
   },
   {
+    name: 'x_article_cover',
+    description: 'Set or replace the cover of an existing X Article draft; it does not publish or change the body. Use only on a draft the user identified, with its exact article_id. Show the returned screenshot to the user. Does not count toward posting limits. Never retry UNCERTAIN without user review.',
+    inputSchema: { ...articleIdSchema, properties: {
+      ...articleIdSchema.properties,
+      cover: { type: 'string', description: 'Absolute local jpg/jpeg/png/webp cover path (~/ supported), at most 5 MB. X shows a crop dialog; the default crop is applied.' },
+    }, required: ['article_id', 'cover'] },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+  },
+  {
     name: 'x_article_publish',
     description: 'PUBLICLY publish one X Article draft. First create it with x_article_draft, show its screenshot, title, warnings and edit_url, and obtain explicit user confirmation of that exact article_id. Counts toward local posting limits. Never retry UNCERTAIN: ask the user to check the Published tab at https://x.com/compose/articles to avoid duplicates.',
     inputSchema: articleIdSchema,
@@ -480,7 +508,7 @@ export const TOOLS = [
 ];
 
 const handlers = { x_status: status, x_login: login, x_preview: preview, x_post: post, x_schedule: schedule, x_list_scheduled: listScheduled, x_cancel_scheduled: cancelScheduled,
-  x_article_draft: articleDraft, x_article_publish: articlePublish, x_article_delete: articleDelete };
+  x_article_draft: articleDraft, x_article_cover: articleCover, x_article_publish: articlePublish, x_article_delete: articleDelete };
 export function hasTool(name) { return Object.hasOwn(handlers, name); }
 
 export async function callTool(name, args) {

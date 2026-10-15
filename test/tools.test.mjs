@@ -16,9 +16,11 @@ process.env.X_POSTER_CHROME_PATH = '/fake/chrome';
 const { config, saveState, loadState } = await import('../server/config.mjs');
 const { appendHistory, readHistory } = await import('../server/limits.mjs');
 const { status, post, preview, schedule, listScheduled, cancelScheduled, login, exclusive, callTool, openUserWindow,
-  articleDraft, articlePublish, articleDelete } = await import('../server/tools.mjs');
+  articleDraft, articleCover, articlePublish, articleDelete } = await import('../server/tools.mjs');
 const articlePath = join(home, 'article.md');
 await writeFile(articlePath, '# Title\n正文');
+const articleCoverPath = join(home, 'cover.png');
+await writeFile(articleCoverPath, 'image');
 after(() => rm(home, { recursive: true, force: true }));
 
 function plainWindow(t, fail = false) {
@@ -142,7 +144,7 @@ test('ordinary login window is shared, blocks tools and checks cookies only afte
   assert.equal(waiting.status, 'waiting_for_user');
   assert.match(waiting.message, /普通的 Chrome/);
   assert.match(waiting.message, /Cmd\+Q/);
-  for (const action of [() => status(), () => preview({ text: 'hello' }), () => post({ text: 'hello' }), () => schedule({ text: 'hello', scheduled_at: new Date(Date.now() + 86400000).toISOString() }), () => listScheduled(), () => cancelScheduled({ id: '123' }), () => articleDraft({ markdown_path: articlePath }), () => articlePublish({ article_id: '123' }), () => articleDelete({ article_id: '123' })]) {
+  for (const action of [() => status(), () => preview({ text: 'hello' }), () => post({ text: 'hello' }), () => schedule({ text: 'hello', scheduled_at: new Date(Date.now() + 86400000).toISOString() }), () => listScheduled(), () => cancelScheduled({ id: '123' }), () => articleDraft({ markdown_path: articlePath }), () => articleCover({ article_id: '123', cover: articleCoverPath }), () => articlePublish({ article_id: '123' }), () => articleDelete({ article_id: '123' })]) {
     await assert.rejects(action(), error => {
       assert.equal(error.code, 'LOGIN_IN_PROGRESS');
       assert.equal(error.message, '登录窗口仍在运行。');
@@ -175,7 +177,7 @@ test('attention window also blocks tools until the process exits', async t => {
   assert.equal(mode, 'attention');
   assert.equal((await login()).data.status, 'window_open');
   assert.equal(spawned.mock.calls[0].arguments[1].at(-1), 'https://x.com/home');
-  for (const action of [() => status(), () => preview({ text: 'hello' }), () => post({ text: 'hello' }), () => schedule({ text: 'hello', scheduled_at: new Date(Date.now() + 86400000).toISOString() }), () => listScheduled(), () => cancelScheduled({ id: '123' }), () => articleDraft({ markdown_path: articlePath }), () => articlePublish({ article_id: '123' }), () => articleDelete({ article_id: '123' })]) {
+  for (const action of [() => status(), () => preview({ text: 'hello' }), () => post({ text: 'hello' }), () => schedule({ text: 'hello', scheduled_at: new Date(Date.now() + 86400000).toISOString() }), () => listScheduled(), () => cancelScheduled({ id: '123' }), () => articleDraft({ markdown_path: articlePath }), () => articleCover({ article_id: '123', cover: articleCoverPath }), () => articlePublish({ article_id: '123' }), () => articleDelete({ article_id: '123' })]) {
     await assert.rejects(action(), error => error.code === 'LOGIN_IN_PROGRESS');
   }
   child.emit('exit', 0);
@@ -392,10 +394,10 @@ test('new tools reject unauthenticated sessions and close the browser', async t 
   t.after(() => { config.historyFile = originalHistory; });
   let closed = 0;
   t.mock.method(Browser, 'open', async () => ({ isLoggedIn: async () => false, close: async () => closed++ }));
-  for (const action of [() => schedule({ text: 'hello', scheduled_at: new Date(Date.now() + 86400000).toISOString() }), () => listScheduled(), () => cancelScheduled({ id: '123' }), () => articleDraft({ markdown_path: articlePath }), () => articlePublish({ article_id: '123' }), () => articleDelete({ article_id: '123' })]) {
+  for (const action of [() => schedule({ text: 'hello', scheduled_at: new Date(Date.now() + 86400000).toISOString() }), () => listScheduled(), () => cancelScheduled({ id: '123' }), () => articleDraft({ markdown_path: articlePath }), () => articleCover({ article_id: '123', cover: articleCoverPath }), () => articlePublish({ article_id: '123' }), () => articleDelete({ article_id: '123' })]) {
     await assert.rejects(action(), error => error.code === 'NOT_LOGGED_IN');
   }
-  assert.equal(closed, 6);
+  assert.equal(closed, 7);
 });
 
 test('uncertain schedules record scheduled_for and share the posting rate limit', async t => {

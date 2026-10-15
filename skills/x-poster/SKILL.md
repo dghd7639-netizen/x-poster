@@ -1,9 +1,9 @@
 ---
 name: x-poster
 description: >-
-  通过本机 Chrome 预览、发布和预排期 X 推文，以及从 Markdown 创建、发布和删除 X 长文章草稿。
+  通过本机 Chrome 预览、发布和预排期 X 推文，从 Markdown 创建、发布和删除 X 长文章草稿，并为已有草稿设置封面。
   用户说“发推”“发 X”“发推特”“把这段话/这张图发到 X”（包括“把这段话发到 X”“把这张图发到 X”）、
-  “post to X”“post on Twitter”“tweet this”“发布 X 文章”或“Markdown 转 X Article”时使用；提供推文、排期和文章的十个 MCP 工具。
+  “post to X”“post on Twitter”“tweet this”“发布 X 文章”或“Markdown 转 X Article”时使用；提供推文、排期和文章的十一个 MCP 工具。
 ---
 
 # X 推文发布
@@ -59,7 +59,11 @@ description: >-
 
 ## 文章（X Articles）
 
+`x_article_cover`、`x_article_publish` 和 `x_article_delete` 仅适用于草稿。
+
 需要符合资格、具备 X Articles 权限的 Premium 账号。先按通用流程用 `x_status` 检查登录，必要时让用户自行登录并完全退出登录窗口。
+
+用户要为已有草稿添加封面或更换封面时，使用用户指定的 `article_id` 调用 `x_article_cover({ article_id, cover })`，不要仅为换封面重建草稿。`cover` 是本地图片绝对路径（支持 `~/`），支持 jpg/jpeg/png/webp，最多 5 MB，推荐 5:2。X 会弹出裁剪对话框，工具应用默认裁剪；完成后向用户展示返回的截图和 `edit_url`。该操作不发布、不修改正文、不写历史、不占发布额度，无需 Codex 发布审批。新文章按以下流程创建：
 
 1. 获取本地 `.md` 文件路径。用户只给文字时，先将文字写入 `.md` 文件，保留用户内容。MCP `markdown_path` 必须是绝对路径，最多 1 MB；标题来自参数 `title`、front matter `title:` 或首个 `# `（优先级从高到低），正文不能为空。
 2. 调用 `x_article_draft({ markdown_path, title?, cover? })`，每次都会**新建**草稿，永不编辑已有草稿。正文图片使用相对于 Markdown 目录的本地路径，最多 50 张、每组最多 4 张；远程图片不下载，会跳过并警告。格式及大小遵循推文图片规则。可选封面通过 front matter `cover:` 或绝对路径参数 `cover` 提供，参数优先；仅支持 jpg/jpeg/png/webp，最多 5 MB。
@@ -67,11 +71,11 @@ description: >-
 4. 询问用户是否发布**这一份草稿**，等待明确确认。用户选择“只要草稿”时立即结束。文章始终先创建草稿作为预览，即使用户提出直接发布，也需先展示并确认这个 id。
 5. 确认后调用 `x_article_publish({ article_id })`，回报返回的 id 和链接（如有）。该操作公开文章，计入与推文共用的发布额度，还需遵循 Codex 每次工具审批。
 
-用户要求修改时，优先让用户在 X 编辑；也可向用户确认删除刚创建的草稿，再调用 `x_article_delete({ article_id })`，从修改后的 Markdown 重新创建并审阅确认。不得未经确认就自动删除重建。**绝不删除插件未创建的草稿，除非用户明确提供 article_id 并确认删除该 id。** 删除不计入发布额度，也不退还原来发布的额度；Codex 每次删除需审批。
+用户要求修改正文时，优先让用户在 X 编辑；也可向用户确认删除刚创建的草稿，再调用 `x_article_delete({ article_id })`，从修改后的 Markdown 重新创建并审阅确认。不得未经确认就自动删除重建。**绝不删除插件未创建的草稿，除非用户明确提供 article_id 并确认删除该 id。** 删除不计入发布额度，也不退还原来发布的额度；Codex 每次删除需审批。
 
 遇到文章 `UNCERTAIN` 绝不重试，请用户核对返回的 `edit_url` 和 `https://x.com/compose/articles` 的“草稿／已发布”标签。保存超时时草稿可能不完整，不能继续当作已保存预览请求发布。
 
-CLI 对应 `article-draft --file <md> [--title …] [--cover <img>]`、`article-publish --id <id>`、`article-delete --id <id>`；CLI 文件路径可相对，真实发布／删除前仍需核对并确认。
+CLI 对应 `article-draft --file <md> [--title …] [--cover <img>]`、`article-cover --id <id> --cover <img>`、`article-publish --id <id>`、`article-delete --id <id>`；CLI 文件路径可相对，真实发布／删除前仍需核对并确认。
 
 ## 错误处理
 

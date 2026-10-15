@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-test('MCP handshake, listing, validation and clean stdin shutdown', { timeout: 10000 }, async t => {
+test('MCP handshake, listing, validation and clean stdin shutdown', { timeout: 5000 }, async t => {
   const home = await mkdtemp(join(tmpdir(), 'x-poster-mcp-'));
   const child = spawn(process.execPath, [fileURLToPath(new URL('../server/index.mjs', import.meta.url))], {
     env: { ...process.env, X_POSTER_HOME: home }, stdio: ['pipe', 'pipe', 'pipe'],
@@ -49,9 +49,13 @@ test('MCP handshake, listing, validation and clean stdin shutdown', { timeout: 1
   child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' })}\n`);
   child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: 'no-method' })}\n`);
   const list = await request('tools/list');
-  assert.deepEqual(list.result.tools.map(tool => tool.name), ['x_status', 'x_login', 'x_preview', 'x_post', 'x_schedule', 'x_list_scheduled', 'x_cancel_scheduled', 'x_article_draft', 'x_article_publish', 'x_article_delete']);
-  assert.equal(list.result.tools.length, 10);
+  assert.deepEqual(list.result.tools.map(tool => tool.name), ['x_status', 'x_login', 'x_preview', 'x_post', 'x_schedule', 'x_list_scheduled', 'x_cancel_scheduled', 'x_article_draft', 'x_article_cover', 'x_article_publish', 'x_article_delete']);
+  assert.equal(list.result.tools.length, 11);
   assert.match(init.result.instructions, /x_article_draft.*x_article_publish/);
+  assert.match(init.result.instructions, /x_article_cover/);
+  const coverTool = list.result.tools.find(tool => tool.name === 'x_article_cover');
+  assert.deepEqual(coverTool.annotations, { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true });
+  assert.deepEqual(coverTool.inputSchema.required, ['article_id', 'cover']);
   const articleDraft = list.result.tools.find(tool => tool.name === 'x_article_draft');
   assert.equal(articleDraft.annotations.readOnlyHint, false);
   assert.equal(articleDraft.annotations.destructiveHint, false);
@@ -59,6 +63,10 @@ test('MCP handshake, listing, validation and clean stdin shutdown', { timeout: 1
   assert.equal(list.result.tools.find(tool => tool.name === 'x_article_delete').annotations.destructiveHint, true);
   assert.match(list.result.tools.find(tool => tool.name === 'x_article_publish').description, /explicit user confirmation.*exact article_id/);
   for (const [name, args] of [['x_article_draft', { markdown_path: 'relative.md' }], ['x_article_draft', {}],
+    ['x_article_cover', { article_id: 'abc', cover: '/tmp/cover.png' }],
+    ['x_article_cover', { article_id: '123', cover: 'relative.png' }],
+    ['x_article_cover', { article_id: '123', cover: '/tmp/cover.gif' }],
+    ['x_article_cover', { article_id: '123', cover: join(home, 'missing.png') }],
     ['x_article_publish', { article_id: '123\n' }], ['x_article_delete', { article_id: 123 }]]) {
     const invalid = await request('tools/call', { name, arguments: args });
     assert.equal(JSON.parse(invalid.result.content[0].text).code, 'INVALID_INPUT');
