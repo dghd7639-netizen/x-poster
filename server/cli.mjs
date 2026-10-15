@@ -3,7 +3,7 @@ import { parseArgs } from 'node:util';
 import { resolve } from 'node:path';
 import { expandHome } from './config.mjs';
 import { XPosterError } from './errors.mjs';
-import { status, preview, post, openUserWindow } from './tools.mjs';
+import { status, preview, post, schedule, listScheduled, cancelScheduled, openUserWindow } from './tools.mjs';
 
 const usage = `x-poster 命令行（需要 Node.js 22 或更高版本）
 
@@ -15,15 +15,20 @@ const usage = `x-poster 命令行（需要 Node.js 22 或更高版本）
   open     打开普通 Chrome 登录或检查账号，等待用户完全退出该 Chrome
   preview  填写并截图预览，不发布
   post     发布已经由用户确认的文字和图片
+  schedule 创建已经由用户预览确认的 X 原生预排期
+  scheduled 查看预排期帖子列表
+  cancel   按 id 取消已经由用户确认的一个预排期帖子
 
 选项：
   --text <文字>     文字中的字面量 \\n 会转换为换行
   --image <路径>    可重复使用，最多 4 张；支持绝对路径、相对路径和 ~
+  --at <ISO>       预排期时间；无偏移量时使用电脑本地时区，至少 5 分钟后
+  --id <数字>      cancel 的预排期帖 id；先列出并确认文字与时间
   -h, --help        显示帮助
 
 先预览，再请用户确认，最后用完全相同的内容发布。
 登录可使用 Google/Apple 账号；完成后按 Cmd+Q 完全退出该 Chrome（Windows/Linux 关闭它的所有窗口）。
-请勿索要或代填密码；遇到 UNCERTAIN 不要重试，请用户检查主页。
+请勿索要或代填密码；遇到 UNCERTAIN 不要重试，请用户检查主页或预排期列表。
 `;
 
 function print(value) { process.stdout.write(`${JSON.stringify(value, null, 2)}\n`); }
@@ -38,7 +43,7 @@ async function main() {
     ({ values, positionals } = parseArgs({
       allowPositionals: true,
       options: {
-        text: { type: 'string' }, image: { type: 'string', multiple: true },
+        id: { type: 'string' }, at: { type: 'string' }, text: { type: 'string' }, image: { type: 'string', multiple: true },
         help: { type: 'boolean', short: 'h' },
       },
     }));
@@ -49,8 +54,15 @@ async function main() {
   }
   if (positionals.length !== 1) throw new XPosterError('INVALID_INPUT', '请只指定一个命令。');
   const [command] = positionals;
+  if (values.at !== undefined && !['preview', 'schedule'].includes(command)) {
+    throw new XPosterError('INVALID_INPUT', '--at 仅用于 preview 或 schedule。');
+  }
+  if (values.id !== undefined && command !== 'cancel') {
+    throw new XPosterError('INVALID_INPUT', '--id 仅用于 cancel。');
+  }
   const input = {
     text: values.text?.replace(/\\n/g, '\n'),
+    ...(values.at !== undefined ? { scheduled_at: values.at } : {}),
     images: (values.image ?? []).map(path => resolve(expandHome(path))),
   };
   switch (command) {
@@ -71,6 +83,9 @@ async function main() {
       return 0;
     }
     case 'preview': print((await preview(input)).data); return 0;
+    case 'schedule': print((await schedule(input)).data); return 0;
+    case 'cancel': print((await cancelScheduled({ id: values.id })).data); return 0;
+    case 'scheduled': print((await listScheduled()).data); return 0;
     case 'post': print((await post(input)).data); return 0;
     default: throw new XPosterError('INVALID_INPUT', '未知命令。', { hint: '使用 --help 查看用法。' });
   }

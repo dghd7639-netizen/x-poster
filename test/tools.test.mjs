@@ -15,7 +15,7 @@ delete process.env.X_POSTER_HEADLESS;
 process.env.X_POSTER_CHROME_PATH = '/fake/chrome';
 const { config, saveState, loadState } = await import('../server/config.mjs');
 const { appendHistory, readHistory } = await import('../server/limits.mjs');
-const { status, post, preview, login, exclusive, callTool, openUserWindow } = await import('../server/tools.mjs');
+const { status, post, preview, schedule, listScheduled, cancelScheduled, login, exclusive, callTool, openUserWindow } = await import('../server/tools.mjs');
 after(() => rm(home, { recursive: true, force: true }));
 
 function plainWindow(t, fail = false) {
@@ -55,6 +55,12 @@ test('input and wait_seconds fail before any browser work', async t => {
   for (const args of [{}, { images: ['relative.png'] }, { text: false }]) {
     await assert.rejects(preview(args), error => error.code === 'INVALID_INPUT');
     await assert.rejects(post(args), error => error.code === 'INVALID_INPUT');
+  }
+  for (const args of [{ text: 'hello' }, { text: 'hello', scheduled_at: '2000-01-01T09:00' }]) {
+    await assert.rejects(schedule(args), error => error.code === 'INVALID_INPUT');
+  }
+  for (const args of [undefined, {}, null, [], { id: 123 }, { id: 'no' }, { id: '' }, { id: '123\n' }, { id: '123', extra: true }]) {
+    assert.throws(() => cancelScheduled(args), error => error.code === 'INVALID_INPUT');
   }
   for (const wait_seconds of [-1, 301, 0.5, '1', null]) {
     await assert.rejects(login({ wait_seconds }), error => error.code === 'INVALID_INPUT');
@@ -133,7 +139,7 @@ test('ordinary login window is shared, blocks tools and checks cookies only afte
   assert.equal(waiting.status, 'waiting_for_user');
   assert.match(waiting.message, /普通的 Chrome/);
   assert.match(waiting.message, /Cmd\+Q/);
-  for (const action of [() => status(), () => preview({ text: 'hello' }), () => post({ text: 'hello' })]) {
+  for (const action of [() => status(), () => preview({ text: 'hello' }), () => post({ text: 'hello' }), () => schedule({ text: 'hello', scheduled_at: new Date(Date.now() + 86400000).toISOString() }), () => listScheduled(), () => cancelScheduled({ id: '123' })]) {
     await assert.rejects(action(), error => {
       assert.equal(error.code, 'LOGIN_IN_PROGRESS');
       assert.equal(error.message, '登录窗口仍在运行。');
@@ -166,7 +172,7 @@ test('attention window also blocks tools until the process exits', async t => {
   assert.equal(mode, 'attention');
   assert.equal((await login()).data.status, 'window_open');
   assert.equal(spawned.mock.calls[0].arguments[1].at(-1), 'https://x.com/home');
-  for (const action of [() => status(), () => preview({ text: 'hello' }), () => post({ text: 'hello' })]) {
+  for (const action of [() => status(), () => preview({ text: 'hello' }), () => post({ text: 'hello' }), () => schedule({ text: 'hello', scheduled_at: new Date(Date.now() + 86400000).toISOString() }), () => listScheduled(), () => cancelScheduled({ id: '123' })]) {
     await assert.rejects(action(), error => error.code === 'LOGIN_IN_PROGRESS');
   }
   child.emit('exit', 0);
@@ -374,4 +380,148 @@ test('callTool hides raw internal errors and writes diagnostic logs to stderr', 
   assert.equal(error.ok, false);
   assert.equal(result.content[0].text.includes('private transport details'), false);
   assert.equal(logged.mock.callCount(), 1);
+});
+
+
+test('new tools reject unauthenticated sessions and close the browser', async t => {
+  const originalHistory = config.historyFile;
+  config.historyFile = join(home, 'not-logged-schedule.jsonl');
+  t.after(() => { config.historyFile = originalHistory; });
+  let closed = 0;
+  t.mock.method(Browser, 'open', async () => ({ isLoggedIn: async () => false, close: async () => closed++ }));
+  for (const action of [() => schedule({ text: 'hello', scheduled_at: new Date(Date.now() + 86400000).toISOString() }), () => listScheduled(), () => cancelScheduled({ id: '123' })]) {
+    await assert.rejects(action(), error => error.code === 'NOT_LOGGED_IN');
+  }
+  assert.equal(closed, 3);
+});
+
+test('uncertain schedules record scheduled_for and share the posting rate limit', async t => {
+  const originalHistory = config.historyFile;
+  config.historyFile = join(home, 'uncertain-schedule.jsonl');
+  t.after(() => { config.historyFile = originalHistory; });
+  const at = new Date(Date.now() + 86400000).toISOString();
+  const opened = t.mock.method(Browser, 'open', async () => ({
+    isLoggedIn: async () => true,
+    newPage: async () => ({ navigate: async () => { throw new XPosterError('UNCERTAIN', '模拟排期不确定。'); }, close: async () => {} }),
+    close: async () => {},
+  }));
+  await assert.rejects(schedule({ text: 'hello', scheduled_at: at }), error => error.code === 'UNCERTAIN');
+  const history = await readHistory(config.historyFile);
+  assert.equal(history[0].uncertain, true);
+  assert.equal(Date.parse(history[0].scheduled_for), Math.ceil(Date.parse(at) / 60000) * 60000);
+  for (const action of [() => post({ text: 'again' }), () => schedule({ text: 'again', scheduled_at: at })]) {
+    await assert.rejects(action(), error => error.code === 'RATE_LIMITED');
+  }
+  assert.equal(opened.mock.callCount(), 1);
+});
+
+
+function scheduledPage(t, { failHistory = false } = {}) {
+  const listeners = new Map();
+  let dialog = false;
+  let selected = [];
+  let pageClosed = false;
+  const range = (first, last) => ['', ...Array.from({ length: last - first + 1 }, (_, i) => String(first + i))];
+  const values = [range(1, 12), range(1, 31), ['', ...Array.from({ length: 3 }, (_, i) => String(new Date().getFullYear() + i))], range(0, 23), range(0, 59)];
+  const page = {
+    navigate: async () => {},
+    waitFor: async () => true,
+    call: async (fn, ...args) => {
+      if (args.length === 3 && typeof args[1] === 'number') { selected[args[1]] = args[2]; return true; }
+      if (args.length === 1 && args[0] === '[role=dialog]') {
+        return values.map((options, i) => ({ value: selected[i] ?? '', options: options.map(value => ({ value, text: value })) }));
+      }
+      if (args.length === 2 && typeof args[1] === 'object') return { button: 'enabled', hasAttachments: true, uploading: false };
+      if (args[0] === '[data-testid=AppTabBar_Profile_Link]') return 'alice';
+      return null;
+    },
+    setFiles: async () => {},
+    screenshot: async () => {
+      if (failHistory) config.historyFile = home;
+      return Buffer.from('mock PNG');
+    },
+    send: async method => method === 'Network.getResponseBody'
+      ? { body: '{"data":{"create":{"scheduled_tweet_id":"123456"}}}' } : {},
+    on: (method, listener) => { listeners.set(method, listener); return () => listeners.delete(method); },
+    click: async selector => {
+      if (selector.endsWith('[data-testid=scheduleOption]')) { dialog = true; return; }
+      if (selector === '[data-testid=scheduledConfirmationPrimaryAction]') { assert.equal(dialog, true); dialog = false; return; }
+      listeners.get('Network.responseReceived')({ requestId: 'r', response: { url: 'https://x.com/i/api/graphql/hash/CreateScheduledTweet' } });
+      listeners.get('Network.loadingFinished')({ requestId: 'r' });
+    },
+    close: async () => { pageClosed = true; },
+  };
+  t.mock.method(Browser, 'open', async () => ({ isLoggedIn: async () => true, newPage: async () => page, close: async () => {} }));
+  return { listeners, closed: () => pageClosed };
+}
+
+test('scheduled preview reports exact minute and confirmation, success persists id and scheduled_for', async t => {
+  const originalHistory = config.historyFile;
+  config.historyFile = join(home, 'confirmed-schedule.jsonl');
+  t.after(() => { config.historyFile = originalHistory; });
+  const mocked = scheduledPage(t);
+  const image = join(home, 'schedule.png');
+  await writeFile(image, 'image');
+  const at = new Date(Date.now() + 86400000).toISOString();
+  const previewResult = (await preview({ images: [image], scheduled_at: at })).data;
+  assert.equal(previewResult.posted, false);
+  assert.match(previewResult.scheduled_at, /[+-]\d{2}:\d{2}$/);
+  assert.equal(Date.parse(previewResult.scheduled_at), Math.ceil(Date.parse(at) / 60000) * 60000);
+  assert.ok(previewResult.scheduled_at_local.length > 10);
+  assert.match(previewResult.next_step, /确认.*相同.*scheduled_at.*x_schedule/);
+  assert.deepEqual(await readHistory(config.historyFile), []);
+  const result = (await schedule({ images: [image], scheduled_at: at })).data;
+  assert.deepEqual(result, {
+    ok: true, scheduled: true, id: '123456', scheduled_at: previewResult.scheduled_at,
+    scheduled_at_local: previewResult.scheduled_at_local, manage_url: 'https://x.com/compose/post/unsent/scheduled',
+  });
+  const history = await readHistory(config.historyFile);
+  assert.equal(history[0].id, result.id);
+  assert.equal(history[0].scheduled_for, result.scheduled_at);
+  assert.equal(history[0].images, 1);
+  assert.equal(mocked.closed(), true);
+  assert.equal(mocked.listeners.size, 0);
+});
+
+test('confirmed schedule with a history failure remains UNCERTAIN and points to the list', async t => {
+  const originalHistory = config.historyFile;
+  config.historyFile = join(home, 'failed-confirmed-schedule.jsonl');
+  t.after(() => { config.historyFile = originalHistory; });
+  t.mock.method(console, 'error', () => {});
+  scheduledPage(t, { failHistory: true });
+  const image = join(home, 'schedule-failure.png');
+  await writeFile(image, 'image');
+  await assert.rejects(schedule({ images: [image], scheduled_at: new Date(Date.now() + 86400000).toISOString() }), error => {
+    assert.equal(error.code, 'UNCERTAIN');
+    assert.match(error.message, /unsent\/scheduled/);
+    assert.match(error.hint, /不要自动重试.*预排期列表/);
+    return true;
+  });
+});
+
+test('scheduled list tool returns records and count without altering posting history', async t => {
+  const originalHistory = config.historyFile;
+  config.historyFile = join(home, 'listed-schedule.jsonl');
+  t.after(() => { config.historyFile = originalHistory; });
+  const events = new Map();
+  let closed = false;
+  t.mock.method(Browser, 'open', async () => ({
+    isLoggedIn: async () => true,
+    newPage: async () => ({
+      send: async method => method === 'Network.getResponseBody' ? { body: '{"data":{"scheduled":[{"id":"12","execute_at":1792112400,"text":"hi"}]}}' } : {},
+      on: (method, listener) => { events.set(method, listener); return () => events.delete(method); },
+      navigate: async () => {
+        events.get('Network.responseReceived')({ requestId: 'r', response: { url: 'https://x.com/i/api/graphql/hash/FetchScheduledTweets' } });
+        events.get('Network.loadingFinished')({ requestId: 'r' });
+      },
+      close: async () => {},
+    }),
+    close: async () => { closed = true; },
+  }));
+  const result = (await listScheduled()).data;
+  assert.equal(result.count, 1);
+  assert.equal(result.scheduled[0].id, '12');
+  assert.equal(closed, true);
+  assert.equal(events.size, 0);
+  assert.deepEqual(await readHistory(config.historyFile), []);
 });

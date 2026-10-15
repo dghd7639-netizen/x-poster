@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { checkRateLimit, readHistory, appendHistory } from '../server/limits.mjs';
 
 const now = Date.parse('2026-10-14T12:00:00Z');
-const entry = ago => ({ ts: new Date(now - ago * 1000).toISOString() });
+const entry = ago => ({ ts: new Date(now - ago * 1000).toISOString(), id: '123' });
 const check = (history, options = {}) => checkRateLimit(history, { now, minIntervalSec: 60, dailyLimit: 20, ...options });
 
 test('empty history is allowed', () => {
@@ -40,4 +40,16 @@ test('history round trips and skips malformed lines', async t => {
   await appendFile(file, 'broken\nnull\n[]\n');
   await appendHistory(file, entry(10));
   assert.deepEqual(await readHistory(file), [entry(30), entry(10)]);
+});
+
+
+test('cancellations and unrelated history never count toward posting limits', () => {
+  const cancellations = Array.from({ length: 30 }, (_, i) => ({ ts: entry(i).ts, cancelled_scheduled: '123' }));
+  const unrelated = [{ ts: entry(0).ts }, { ts: entry(0).ts, event: 'status' }];
+  assert.deepEqual(check([...cancellations, ...unrelated]), check([]));
+  assert.deepEqual(check([entry(30), ...cancellations, ...unrelated]), check([entry(30)]));
+  const uncertain = { ts: entry(20).ts, uncertain: true, text: 'draft', images: 0 };
+  const scheduled = { ts: entry(10).ts, id: '456', scheduled_for: '2026-10-20T09:00:00+08:00' };
+  assert.equal(check([uncertain, scheduled, ...cancellations]).postsLast24h, 2);
+  assert.equal(check([uncertain, scheduled, ...cancellations]).retryAfterSec, 50);
 });

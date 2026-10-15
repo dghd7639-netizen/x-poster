@@ -49,7 +49,28 @@ test('MCP handshake, listing, validation and clean stdin shutdown', { timeout: 1
   child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' })}\n`);
   child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: 'no-method' })}\n`);
   const list = await request('tools/list');
-  assert.deepEqual(list.result.tools.map(tool => tool.name), ['x_status', 'x_login', 'x_preview', 'x_post']);
+  assert.deepEqual(list.result.tools.map(tool => tool.name), ['x_status', 'x_login', 'x_preview', 'x_post', 'x_schedule', 'x_list_scheduled', 'x_cancel_scheduled']);
+  assert.match(init.result.instructions, /x_schedule/);
+  const scheduleTool = list.result.tools.find(tool => tool.name === 'x_schedule');
+  assert.deepEqual(scheduleTool.inputSchema.required, ['scheduled_at']);
+  assert.equal(scheduleTool.annotations.idempotentHint, false);
+  assert.equal(list.result.tools.find(tool => tool.name === 'x_list_scheduled').annotations.readOnlyHint, true);
+  for (const arguments_ of [{ text: 'hello' }, { text: 'hello', scheduled_at: '2000-01-01T09:00' }]) {
+    const invalid = await request('tools/call', { name: 'x_schedule', arguments: arguments_ });
+    assert.equal(invalid.result.isError, true);
+    assert.equal(JSON.parse(invalid.result.content[0].text).code, 'INVALID_INPUT');
+  }
+  assert.match(init.result.instructions, /x_cancel_scheduled/);
+  const cancelTool = list.result.tools.find(tool => tool.name === 'x_cancel_scheduled');
+  assert.equal(cancelTool.annotations.destructiveHint, true);
+  assert.equal(cancelTool.annotations.idempotentHint, false);
+  assert.equal(cancelTool.annotations.openWorldHint, true);
+  assert.equal(cancelTool.inputSchema.properties.id.pattern, '^\\d+$');
+  for (const arguments_ of [{ id: 'not-numeric' }, { id: '123\n' }, { id: 123 }, {}]) {
+    const invalid = await request('tools/call', { name: 'x_cancel_scheduled', arguments: arguments_ });
+    assert.equal(invalid.result.isError, true);
+    assert.equal(JSON.parse(invalid.result.content[0].text).code, 'INVALID_INPUT');
+  }
   const loginTool = list.result.tools.find(tool => tool.name === 'x_login');
   assert.match(loginTool.description, /ordinary Chrome/);
   assert.match(loginTool.description, /Google\/Apple/);

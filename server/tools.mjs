@@ -4,8 +4,8 @@ import { Browser, findChrome, openPlainWindow } from './chrome.mjs';
 import { config, ensureHome, loadState, saveState } from './config.mjs';
 import { XPosterError } from './errors.mjs';
 import { appendHistory, checkRateLimit, readHistory } from './limits.mjs';
-import { MAX_WEIGHTED_LENGTH, validatePostInput } from './validate.mjs';
-import { compose, URLS } from './x.mjs';
+import { MAX_WEIGHTED_LENGTH, validatePostInput, parseScheduledAt } from './validate.mjs';
+import { compose, listScheduled as readScheduled, cancelScheduled as deleteScheduled, URLS } from './x.mjs';
 
 let queue = Promise.resolve();
 export function exclusive(fn) {
@@ -147,10 +147,29 @@ async function preparePreviews() {
   }
 }
 
-async function runCompose(args, submit) {
+function scheduledTime(date) {
+  const pad = value => String(value).padStart(2, '0');
+  const offset = -date.getTimezoneOffset();
+  const local = `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}.${String(date.getMilliseconds()).padStart(3, '0')}`;
+  return {
+    scheduled_at: `${local}${offset < 0 ? '-' : '+'}${pad(Math.floor(Math.abs(offset) / 60))}:${pad(Math.abs(offset) % 60)}`,
+    scheduled_at_local: `${date.toLocaleString('zh-CN', { hour12: false, timeZoneName: 'long' })} (${Intl.DateTimeFormat().resolvedOptions().timeZone})`,
+  };
+}
+
+async function runCompose(args, mode) {
+  let scheduled = mode === 'schedule' || args != null && Object.hasOwn(args, 'scheduled_at')
+    ? parseScheduledAt(args?.scheduled_at) : null;
+  // X's UI only accepts minutes; round up and report the exact time that will be selected.
+  if (scheduled) scheduled = parseScheduledAt(new Date(Math.ceil(scheduled.date.getTime() / 60000) * 60000).toISOString());
+  if (mode === 'post' && scheduled) throw new XPosterError('INVALID_INPUT', '带 scheduled_at 的帖子请使用 x_schedule。');
   const input = await validatePostInput(args);
+  const submit = mode !== 'preview';
+  const time = scheduled ? scheduledTime(scheduled.date) : {};
+  const scheduledHistory = scheduled ? { scheduled_for: time.scheduled_at } : {};
   return exclusive(async () => {
     requireUserWindowClosed();
+    if (scheduled) parseScheduledAt(scheduled.date.toISOString());
     if (submit) {
       const rate = limits(await readHistory(config.historyFile));
       if (!rate.allowed) {
@@ -163,7 +182,7 @@ async function runCompose(args, submit) {
     await preparePreviews();
     const browser = await openBrowser(config.headless);
     const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const screenshotPath = join(config.previewsDir, `${stamp}-${submit ? 'post' : 'preview'}.png`);
+    const screenshotPath = join(config.previewsDir, `${stamp}-${mode}.png`);
     let result;
     try {
       if (!await browser.isLoggedIn()) {
@@ -172,41 +191,42 @@ async function runCompose(args, submit) {
         });
       }
       try {
-        result = await compose(browser, { ...input, submit, screenshotPath });
+        result = await compose(browser, { ...input, mode, scheduledAt: scheduled?.components, screenshotPath });
       } catch (error) {
         if (submit && error instanceof XPosterError && error.code === 'UNCERTAIN') {
           await appendHistory(config.historyFile, {
-            ts: new Date().toISOString(), uncertain: true, text: input.text.slice(0, 80), images: input.images.length,
+            ts: new Date().toISOString(), uncertain: true, ...scheduledHistory, text: input.text.slice(0, 80), images: input.images.length,
           }).catch(failure => console.error('保存不确定发布记录失败：', failure));
         }
         throw error;
       }
       if (submit) {
         const postedAt = new Date().toISOString();
-        const url = `https://x.com/${result.username ?? 'i'}/status/${result.id}`;
+        const url = mode === 'schedule' ? URLS.scheduled : `https://x.com/${result.username ?? 'i'}/status/${result.id}`;
         try {
           await appendHistory(config.historyFile, {
-            ts: postedAt, id: result.id, url, text: input.text.slice(0, 80), images: input.images.length,
+            ts: postedAt, id: result.id, url, ...scheduledHistory, text: input.text.slice(0, 80), images: input.images.length,
           });
         } catch (error) {
           console.error('保存已发布帖子记录失败：', error);
-          throw new XPosterError('UNCERTAIN', `X 已返回发布成功，但本地历史记录保存失败。帖子链接：${url}`, {
-            hint: '不要自动重试。请用户检查帖子和数据目录权限；本次发布未能计入本地限制。',
+          throw new XPosterError('UNCERTAIN', `X 已返回${mode === 'schedule' ? '预排期' : '发布'}成功，但本地历史记录保存失败。检查链接：${url}`, {
+            hint: `不要自动重试。请用户检查${mode === 'schedule' ? '预排期列表' : '帖子'}和数据目录权限；本次操作未能计入本地限制。`,
           });
         }
         if (result.username) {
           await saveState({ username: result.username }).catch(error => console.error('保存用户名失败：', error));
         }
+        if (mode === 'schedule') return { data: { ok: true, scheduled: true, id: result.id, ...time, manage_url: URLS.scheduled } };
         return { data: { ok: true, posted: true, id: result.id, url, username: result.username, posted_at: postedAt } };
       }
       if (result.username) await saveState({ username: result.username });
       return { data: {
         ok: true, posted: false, preview_image: screenshotPath,
-        text: input.text, images: input.images, weighted_length: input.weightedLength,
+        text: input.text, images: input.images, weighted_length: input.weightedLength, ...time,
         ...(input.weightedLength > MAX_WEIGHTED_LENGTH ? {
           warning: '加权长度超过 280；非 Premium 账号可能需要缩短文字。中日韩文字和 emoji 计 2，链接计 23。',
         } : {}),
-        next_step: '这只是预览，尚未发布。请把截图和最终文字给用户确认；用户同意后，用完全相同的 text 和 images 调用 x_post。',
+        next_step: scheduled ? '这只是预览，尚未创建预排期。请把截图、最终文字和准确排期时间给用户确认；用户明确同意后，用完全相同的 text、images 和 scheduled_at 调用 x_schedule。' : '这只是预览，尚未发布。请把截图和最终文字给用户确认；用户同意后，用完全相同的 text 和 images 调用 x_post。',
       }, image: result.screenshot };
     } finally {
       await browser.close().catch(error => console.error('关闭浏览器失败：', error));
@@ -214,8 +234,56 @@ async function runCompose(args, submit) {
   });
 }
 
-export function preview(args) { return runCompose(args, false); }
-export function post(args) { return runCompose(args, true); }
+export function preview(args) { return runCompose(args, 'preview'); }
+export function post(args) { return runCompose(args, 'post'); }
+export function schedule(args) { return runCompose(args, 'schedule'); }
+
+export function listScheduled(args = {}) {
+  if (!args || typeof args !== 'object' || Array.isArray(args) || Object.keys(args).length) {
+    throw new XPosterError('INVALID_INPUT', '预排期列表不接受参数。');
+  }
+  return exclusive(async () => {
+    requireUserWindowClosed();
+    const browser = await openBrowser(config.headless);
+    try {
+      if (!await browser.isLoggedIn()) {
+        throw new XPosterError('NOT_LOGGED_IN', '尚未登录 X。', { hint: '请调用 x_login，让用户自己在 Chrome 窗口中登录。' });
+      }
+      const scheduled = await readScheduled(browser);
+      return { data: { scheduled, count: scheduled.length } };
+    } finally {
+      await browser.close().catch(error => console.error('关闭浏览器失败：', error));
+    }
+  });
+}
+
+export function cancelScheduled(args) {
+  if (!args || typeof args !== 'object' || Array.isArray(args) || typeof args.id !== 'string'
+    || !args.id || /\D/.test(args.id) || Object.keys(args).some(key => key !== 'id')) {
+    throw new XPosterError('INVALID_INPUT', 'id 必须是预排期帖的纯数字字符串。');
+  }
+  return exclusive(async () => {
+    requireUserWindowClosed();
+    const browser = await openBrowser(config.headless);
+    try {
+      if (!await browser.isLoggedIn()) {
+        throw new XPosterError('NOT_LOGGED_IN', '尚未登录 X。', { hint: '请调用 x_login，让用户自己在 Chrome 窗口中登录。' });
+      }
+      const result = await deleteScheduled(browser, args.id);
+      try {
+        await appendHistory(config.historyFile, { ts: new Date().toISOString(), cancelled_scheduled: args.id });
+      } catch (error) {
+        console.error('保存取消预排期记录失败：', error);
+        throw new XPosterError('UNCERTAIN', '已核验预排期帖被删除，但本地历史记录保存失败。', {
+          hint: '绝不自动重试。请用户检查 X 预排期列表及数据目录权限。',
+        });
+      }
+      return { data: { ok: true, ...result } };
+    } finally {
+      await browser.close().catch(error => console.error('关闭浏览器失败：', error));
+    }
+  });
+}
 
 const postSchema = {
   type: 'object',
@@ -225,6 +293,14 @@ const postSchema = {
       description: 'Absolute local paths to up to 4 jpg/jpeg/png/webp/gif images. Images may be at most 5 MB each; GIFs at most 15 MB.' },
   },
   additionalProperties: false,
+};
+
+const scheduledSchema = {
+  ...postSchema,
+  properties: {
+    ...postSchema.properties,
+    scheduled_at: { type: 'string', description: 'ISO 8601 date-time, at least 5 minutes in the future and no later than the current year + 2. Uses computer local time unless an offset is given. Nonzero seconds are rounded up to the next minute; preview reports the exact selected time.' },
+  },
 };
 
 export const TOOLS = [
@@ -245,8 +321,8 @@ export const TOOLS = [
   },
   {
     name: 'x_preview',
-    description: 'Fill the X composer with text and local images, take a screenshot, and discard without posting. Show the screenshot and final text to the user and obtain explicit confirmation before calling x_post with exactly the same text and images. Login is performed by the human; never request or type passwords.',
-    inputSchema: postSchema,
+    description: 'Fill the X composer with text and local images, optionally set scheduled_at through the schedule dialog, take a screenshot, and discard without posting. Scheduled posts must also be previewed and explicitly confirmed first: show the screenshot, final text and exact time, then call x_schedule with identical text, images and scheduled_at; otherwise call x_post with identical text and images. Time is local unless an offset is given. Never retry UNCERTAIN. The human handles login; never request or type passwords.',
+    inputSchema: scheduledSchema,
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   },
   {
@@ -255,9 +331,27 @@ export const TOOLS = [
     inputSchema: postSchema,
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
   },
+  {
+    name: 'x_schedule',
+    description: 'Create one scheduled X post using X native server-side scheduling; the computer can be off at publication time. Scheduled posts must also be previewed and explicitly confirmed first: use x_preview with scheduled_at, show the screenshot, final text and exact time, obtain confirmation, then use identical text, images and scheduled_at. Time is local unless an offset is given. Scheduling counts toward local posting limits. Never retry UNCERTAIN: ask the user to check the X scheduled list to avoid duplicates.',
+    inputSchema: { ...scheduledSchema, required: ['scheduled_at'] },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+  },
+  {
+    name: 'x_list_scheduled',
+    description: 'List scheduled X posts with ids, ISO times, text, media counts and state, sorted by time. Scheduled posts must also be previewed and explicitly confirmed first via x_preview and x_schedule with identical text, images and scheduled_at. Time is local unless an offset is given. Never retry an UNCERTAIN creation; check this list and let the user verify. Use x_cancel_scheduled only after showing the exact post and time and obtaining explicit user confirmation; the human can also cancel in X web UI.',
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+    annotations: { readOnlyHint: true, openWorldHint: true },
+  },
+  {
+    name: 'x_cancel_scheduled',
+    description: 'Cancel (delete) one scheduled X post by its numeric id from x_list_scheduled. First list scheduled posts, show the user the exact post text and scheduled time that will be cancelled, and obtain explicit confirmation before calling this destructive tool. It verifies the target before selection and re-fetches the list after deletion to check that the target is gone and all other ids remain. Never retry UNCERTAIN: ask the user to check X immediately, especially if another post may have been removed.',
+    inputSchema: { type: 'object', properties: { id: { type: 'string', pattern: '^\\d+$', description: 'Numeric scheduled-post id returned by x_list_scheduled.' } }, required: ['id'], additionalProperties: false },
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+  },
 ];
 
-const handlers = { x_status: status, x_login: login, x_preview: preview, x_post: post };
+const handlers = { x_status: status, x_login: login, x_preview: preview, x_post: post, x_schedule: schedule, x_list_scheduled: listScheduled, x_cancel_scheduled: cancelScheduled };
 export function hasTool(name) { return Object.hasOwn(handlers, name); }
 
 export async function callTool(name, args) {

@@ -7,7 +7,7 @@
       "startup_timeout_sec": 20,
       "tool_timeout_sec": 300,
       "env_vars": ["X_POSTER_HOME", "X_POSTER_CHROME_PATH", "X_POSTER_HEADLESS", "X_POSTER_MIN_INTERVAL_SEC", "X_POSTER_DAILY_LIMIT"],
-      "tools": { "x_post": { "approval_mode": "prompt" } }
+      "tools": { "x_post": { "approval_mode": "prompt" }, "x_schedule": { "approval_mode": "prompt" }, "x_cancel_scheduled": { "approval_mode": "prompt" } }
     }
   }
 }

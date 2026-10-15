@@ -80,3 +80,26 @@ export async function validatePostInput(input = {}) {
   }
   return { text, images: paths, weightedLength: weightedLength(text) };
 }
+
+export function parseScheduledAt(value, now = new Date()) {
+  const match = typeof value === 'string' && value.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d+))?)?(Z|[+-]\d{2}:\d{2})?$/);
+  const invalid = () => new XPosterError('INVALID_INPUT', 'scheduled_at 必须是有效的 ISO 8601 日期时间；无偏移量时使用电脑本地时区。');
+  if (!match) throw invalid();
+  const [, y, m, d, h, min, sec = '0', , offset] = match;
+  const days = new Date(Date.UTC(Number(y), Number(m), 0)).getUTCDate();
+  if (Number(m) < 1 || Number(m) > 12 || Number(d) < 1 || Number(d) > days
+    || Number(h) > 23 || Number(min) > 59 || Number(sec) > 59) throw invalid();
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) throw invalid();
+  if (!offset && (date.getFullYear() !== Number(y) || date.getMonth() + 1 !== Number(m)
+    || date.getDate() !== Number(d) || date.getHours() !== Number(h) || date.getMinutes() !== Number(min))) throw invalid();
+  if (date.getTime() - now.getTime() < 5 * 60 * 1000) {
+    throw new XPosterError('INVALID_INPUT', '预排期时间必须至少在 5 分钟以后。');
+  }
+  if (date.getFullYear() > now.getFullYear() + 2) {
+    throw new XPosterError('INVALID_INPUT', '预排期年份不能超过当前年份加 2 年。');
+  }
+  return { date, components: {
+    year: date.getFullYear(), month: date.getMonth() + 1, day: date.getDate(), hour: date.getHours(), minute: date.getMinutes(),
+  } };
+}

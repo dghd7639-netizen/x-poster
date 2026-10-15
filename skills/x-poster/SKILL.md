@@ -1,9 +1,9 @@
 ---
 name: x-poster
 description: >-
-  通过本机 Chrome 预览并发布 X 推文，支持文字和最多 4 张本地图片。
+  通过本机 Chrome 预览、发布和预排期 X 推文，支持文字和最多 4 张本地图片。
   用户说“发推”“发 X”“发推特”“把这段话/这张图发到 X”（包括“把这段话发到 X”“把这张图发到 X”）、
-  “post to X”“post on Twitter”或“tweet this”时使用；调用 x_status、x_login、x_preview、x_post 四个 MCP 工具。
+  “post to X”“post on Twitter”或“tweet this”时使用；调用 x_status、x_login、x_preview、x_post、x_schedule、x_list_scheduled、x_cancel_scheduled 七个 MCP 工具。
 ---
 
 # X 推文发布
@@ -37,11 +37,31 @@ description: >-
    - Codex 插件为每次 `x_post` 配置工具审批；直接发布的请求仍须遵循宿主审批。
    - 发布前如登录态或额度发生变化，先处理对应错误。
 
+## 预排期
+
+1. 先按上述流程检查登录态与额度。将“明天早上 9 点”等自然语言时间转换为 ISO 8601 本地时间（例如 `2026-10-16T09:00`）；日期、时区或上午／下午有歧义时先询问用户。
+2. 不带偏移量时使用电脑本地时区；带 `Z` 或 `±hh:mm` 时转换为本地时间。至少在 5 分钟后，年份不能超过当前年份加 2。X 的时间控件精确到分钟，输入含非零秒数时向上取整到下一分钟，以预览返回的准确时间为准。
+3. 调用 `x_preview`，提供 `text`、`images` 和 `scheduled_at`。展示返回的截图、最终文字及准确的 `scheduled_at_local`（同时展示带偏移量的 `scheduled_at`），等待用户**明确确认**。修改内容或时间后重新预览确认。
+4. 使用完全相同的 `text`、`images`、`scheduled_at` 调用 `x_schedule`。排期也必须先预览确认；每次 `x_schedule` 还需遵循 Codex 宿主工具审批。
+5. 成功后回报排期 id、准确时间和 `manage_url`。由 X 服务器到时发布，电脑可以关机；创建排期也计入本地发布限制。
+
+查看排期使用 `x_list_scheduled`，返回按时间排序的 id、时间、文字、图片数量和状态（`state`，未知时为 `null`）。
+
+## 取消预排期
+
+1. 先调用 `x_list_scheduled`，使用返回的排期 id；不得猜测 id 或按文字自动批量取消。
+2. 向用户展示待取消帖子的完整文字、准确排期时间和 id，得到**明确确认**后才调用 `x_cancel_scheduled({ id })`。更换目标需重新确认；Codex 每次取消还需宿主审批。
+3. 工具在编辑模式选择前核对条数、顺序与文字，删除后重新读取列表，验证目标消失且其他 id 均保留。文字和时间相同的重复项无法安全区分时，交由用户在网页处理。
+4. 成功后回报取消 id 和剩余数量 `remaining`。取消记录不会占用发布额度，也不会退还原排期已占用的额度。
+5. 遇到 `UNCERTAIN` **绝不重试**。目标仍在时请用户核查；若提示其他帖子可能被误删，立即提醒用户检查 X 预排期列表，不再执行删除。
+
+用户也可以直接在 X 网页“未发送的帖子 → 预排期”中取消。CLI 对应 `scheduled` 和 `cancel --id <id>`；先列出、展示准确文字与时间并确认，再执行取消。
+
 ## 错误处理
 
 | 错误码 | 行动 |
 |---|---|
-| `INVALID_INPUT` | 说明参数问题，核对文字、路径、格式、数量和大小；更改内容后重新预览确认。 |
+| `INVALID_INPUT` | 说明参数问题，核对文字、路径、格式、数量、大小和排期时间（ISO 8601、至少 5 分钟后、年份不超过当前年份加 2）；更改内容后重新预览确认；取消时核对纯数字 id，目标不存在或有同文同时间的歧义则停止。 |
 | `NOT_LOGGED_IN` | 调用 `x_login`，让用户在普通 Chrome 中自行登录并按 Cmd+Q 完全退出（Windows/Linux 关闭它的所有窗口），再用 `x_status` 确认。 |
 | `LOGIN_IN_PROGRESS` | 请用户完成已有登录窗口中的操作，按 Cmd+Q 完全退出该 Chrome（Windows/Linux 关闭它的所有窗口），再调用 `x_status`；不重复启动登录。 |
 | `ACCOUNT_CHALLENGE` | 调用 `x_login` 打开普通窗口，让用户自行完成验证后完全退出该 Chrome；绝不绕过 CAPTCHA。 |
@@ -54,7 +74,7 @@ description: >-
 | `TEXT_REJECTED` | 解释 X 拒绝文字，核对加权长度；请用户修改或审阅新草稿后重新预览。 |
 | `POST_REJECTED` | 展示 X 的拒绝原因，例如重复内容或疑似自动化；停止发布，交由用户决定。 |
 | `UI_CHANGED` | 告知页面选择器失效，需要维护 `server/x.mjs` 中的 `SELECTORS`。 |
-| `UNCERTAIN` | **绝不重试**；请用户检查自己的 X 主页，确认是否已发出。 |
+| `UNCERTAIN` | **绝不重试**；请用户检查自己的 X 主页；预排期则检查 X 的“未发送的帖子 → 预排期”，确认是否已创建或取消；若其他 id 消失，立即提醒用户核查可能被误删的帖子。 |
 | `INTERNAL_ERROR` | 停止并报告意外错误；诊断时不暴露登录态等敏感数据。 |
 
 ## 规则
