@@ -24,13 +24,25 @@ function fixture(options = {}) {
   const tagged = new Map();
   let requestNumber = 0;
   const emit = (method, value) => { for (const fn of handlers.get(method) ?? []) fn(value); };
-  const response = (operation, body = { data: { ok: true } }, variables = { articleEntityId: '123' }, status = 200) => {
+  const response = (operation, body = { data: { ok: true } }, variables = { articleEntityId: '123' }, status = 200, method = 'POST') => {
     const requestId = String(++requestNumber);
-    const url = `https://x.com/i/api/graphql/hash/${operation}`;
-    emit('Network.requestWillBeSent', { requestId, request: { url, method: 'POST', postData: JSON.stringify({ variables }) } });
+    const query = method === 'GET' ? `?${new URLSearchParams({ variables: JSON.stringify(variables) })}` : '';
+    const url = `https://x.com/i/api/graphql/hash/${operation}${query}`;
+    emit('Network.requestWillBeSent', { requestId, request: { url, method,
+      ...(method === 'POST' ? { postData: JSON.stringify({ variables }) } : {}) } });
     bodies.set(requestId, body);
     emit('Network.responseReceived', { requestId, response: { url, status } });
     emit('Network.loadingFinished', { requestId });
+  };
+  const lookupArticle = () => {
+    const lookup = state.articleLookup;
+    if (!lookup) return;
+    const receive = () => {
+      calls.push(['articleResponse', Date.now()]);
+      response('ArticleEntityResultByRestId', lookup.body, lookup.variables, lookup.status ?? 200, lookup.method ?? 'GET');
+    };
+    if (lookup.delay) setTimeout(receive, lookup.delay);
+    else receive();
   };
   const element = (kind, text = '', attrs = {}) => ({ kind, innerText: text, textContent: text, disabled: false,
     value: '', placeholder: '', getAttribute: name => attrs[name] ?? null,
@@ -72,20 +84,25 @@ function fixture(options = {}) {
   const coverButton = element('coverButton');
   const coverArea = element('coverArea');
   const coverMedia = element('coverMedia');
-  coverMedia.tagName = 'IMG';
+  coverMedia.tagName = state.coverTagName ?? 'IMG';
   Object.defineProperties(coverMedia, {
     complete: { get: () => state.coverComplete ?? Date.now() >= (state.coverReadyAt ?? 0) },
     naturalWidth: { get: () => state.coverNaturalWidth ?? 1200 },
   });
   coverMedia.getBoundingClientRect = () => ({ width: state.coverWidth ?? 1200 });
+  coverMedia.getAttribute = name => name === 'aria-hidden' ? state.coverAriaHidden ?? null : null;
+  Object.defineProperty(coverMedia, 'src', { get: () => state.coverSrc ?? 'https://pbs.twimg.com/media/cover.jpg' });
   const extraCoverImages = (state.extraCoverImages ?? []).map(scope => ({
-    tagName: 'IMG', complete: true, naturalWidth: 1200,
+    tagName: 'IMG', complete: true, naturalWidth: scope === 'thumbnail' ? 32 : 1200,
+    getAttribute: () => null,
     getBoundingClientRect: () => ({ width: scope === 'thumbnail' ? 32 : 1200 }),
     closest: selector => scope === 'body' && selector === S.composer ? composer
       : scope === 'dialog' && selector === S.dialog ? dialog : null,
   }));
   coverMedia.closest = selector => state.mediaInBody && selector === S.composer ? composer
-    : state.mediaInDialog && selector === S.dialog ? dialog : null;
+    : state.mediaInDialog && selector === S.dialog ? dialog
+      : state.mediaInCoverButton && selector === S.cover ? coverButton
+        : state.coverHiddenAncestor && selector === '[aria-hidden="true"]' ? coverArea : null;
   coverArea.querySelectorAll = selector => selector === 'img, video' ? [...extraCoverImages, ...(state.cover ? [coverMedia] : [])] : [];
   const editorArea = element('editorArea');
   editorArea.contains = other => other === composer;
@@ -130,14 +147,21 @@ function fixture(options = {}) {
   class DataTransfer { values = {}; setData(type, value) { this.values[type] = value; } }
   class ClipboardEvent { constructor(type, options) { Object.assign(this, options); } }
   const page = {
-    async navigate(url) { calls.push(['navigate', url]); state.pathname = state.redirect ?? new URL(url).pathname; if (state.pathname.includes('/edit/')) state.title ||= 'Existing'; if (state.oldCoverResponse) response('ArticleEntityUpdateCoverMedia'); },
+    async navigate(url) {
+      calls.push(['navigate', url]);
+      state.pathname = state.redirect ?? new URL(url).pathname;
+      if (state.pathname.includes('/edit/')) state.title ||= 'Existing';
+      if (state.oldCoverResponse) response('ArticleEntityUpdateCoverMedia');
+      if (url.includes('/edit/')) lookupArticle();
+    },
     async call(fn, ...args) {
       return runInNewContext(`(${fn.toString()})(...args)`, { args, document, location: state, DataTransfer, ClipboardEvent,
         window: { scrollTo(...args) { calls.push(['scroll', ...args]); } }, Node: { DOCUMENT_POSITION_FOLLOWING: 4 } });
     },
     async waitFor(fn, args = [], waitOptions = {}) {
       calls.push(['waitFor', waitOptions.timeout]);
-      for (let i = 0; i < 3; i++) {
+      const deadline = Date.now() + (waitOptions.timeout ?? 30000);
+      for (let i = 0; state.pollWaits || i < 3; i++) {
         const result = await this.call(fn, ...args);
         calls.push(['waitResult', result]);
         if (result) return result;
@@ -149,6 +173,10 @@ function fixture(options = {}) {
           calls.push(['processing', state.processingText, state.cancelUpload]);
           state.processingIndex++;
           Object.assign(state, state.processingStages[state.processingIndex]);
+        }
+        if (state.pollWaits) {
+          if (Date.now() >= deadline) return null;
+          await new Promise(resolve => setTimeout(resolve, 250));
         }
       }
       return null;
@@ -166,7 +194,7 @@ function fixture(options = {}) {
         if (kind === 'media') media = element('media', state.english ? 'Media' : '媒体');
         throw new XPosterError('UI_CHANGED', '找不到页面按钮。');
       }
-      if (kind === 'create') { state.pathname = '/compose/articles/edit/123'; state.title = ''; }
+      if (kind === 'create') { state.pathname = '/compose/articles/edit/123'; state.title = ''; lookupArticle(); }
       if (kind === 'insert' || kind === 'more') state.menu = true;
       if (kind === 'media') { state.menu = false; state.dialog = 'media'; }
       if (kind === 'coverButton' && !state.noChooser) {
@@ -180,7 +208,7 @@ function fixture(options = {}) {
         state.coverReadyAt = Date.now() + (state.coverLoadDelay ?? 0);
         state.mediaInBody = state.mediaInDialog = false;
         if (state.processingStages) Object.assign(state, state.processingStages[0]);
-        if (!state.noSave) {
+        if (!state.noSave && !state.noCoverSave) {
           const save = () => {
             calls.push(['coverResponse', Date.now()]);
             response(state.coverOperation ?? 'ArticleEntityUpdateCoverMedia', state.coverBody ?? { data: { ok: true } },
@@ -219,7 +247,11 @@ function fixture(options = {}) {
       return {};
     },
     on(method, handler) { if (!handlers.has(method)) handlers.set(method, new Set()); handlers.get(method).add(handler); return () => handlers.get(method).delete(handler); },
-    async screenshot() { calls.push(['screenshot', Date.now()]); return Buffer.from('mock PNG'); },
+    async screenshot() {
+      calls.push(['screenshot', Date.now()]);
+      if (state.screenshotError) throw new Error('screenshot failed');
+      return Buffer.from('mock PNG');
+    },
     async close() { state.closed = true; },
   };
   return { page, browser: { newPage: async () => page }, state, calls, response,
@@ -764,7 +796,7 @@ test('cover MCP expands home paths and accepts the 5 MB boundary', async t => {
   assert.deepEqual(f.calls.find(call => call[0] === 'files')[2], [cover]);
 });
 
-test('uncertain cover MCP and screenshot failures keep history unchanged and include the draft id', async t => {
+test('uncertain cover MCP keeps history unchanged and includes the draft id', async t => {
   const f = await toolFixture(t, { noSave: true });
   const cover = join(f.dir, 'cover.png');
   await writeFile(cover, 'image');
@@ -776,11 +808,6 @@ test('uncertain cover MCP and screenshot failures keep history unchanged and inc
   assert.equal(failure.edit_url, 'https://x.com/compose/articles/edit/123');
   assert.deepEqual(await readHistory(config.historyFile), []);
   assert.equal(f.state.browserClosed, true);
-  const direct = fixture();
-  await assert.rejects(runClock(t, () => setArticleCover(direct.browser, '123', { cover, screenshotPath: f.dir })),
-    error => error.code === 'UNCERTAIN' && error.details.article_id === '123');
-  assert.equal(direct.state.closed, true);
-  assert.equal(direct.listenerCount(), 0);
 });
 
 
@@ -800,6 +827,7 @@ test('cover screenshots wait for the large image to load for new and existing dr
 test('cover image load timeout still returns a successful screenshot with a warning', async t => {
   const args = await input(t, { cover: '/tmp/cover.png' });
   for (const create of [false, true]) for (const imageState of [{ coverComplete: false }, { coverNaturalWidth: 0 }, { noCover: true }]) {
+    if (create && imageState.noCover) continue;
     const f = fixture({ ...imageState, extraCoverImages: imageState.noCover ? ['body', 'dialog'] : ['body', 'dialog', 'thumbnail'] });
     const result = await runClock(t, () => create ? createArticleDraft(f.browser, args) : setArticleCover(f.browser, '123', args));
     assert.equal(result.cover, true);
@@ -861,4 +889,291 @@ test('left-list Published text does not classify a draft or a loading editor as 
   }
   const loading = fixture({ leftPublished: true, editorMissing: true });
   await assert.rejects(runClock(t, () => setArticleCover(loading.browser, '123', args)), error => error.code === 'UI_CHANGED');
+});
+
+test('draft cover requires a fresh matching successful CoverMedia response', async t => {
+  const args = await input(t, { cover: '/tmp/cover.png' });
+  for (const options of [{ noCoverSave: true }, { noCoverSave: true, oldCoverResponse: true },
+    { coverOperation: 'ArticleEntityUpdateContent' }, { coverId: '999' }, { coverStatus: 500 },
+    { coverBody: { data: { ok: true }, errors: [{ message: 'denied' }] } }]) {
+    const f = fixture(options);
+    await runClock(t, async () => {
+      const start = Date.now();
+      await assert.rejects(createArticleDraft(f.browser, args), error => {
+        assert.equal(error.code, 'UNCERTAIN');
+        assert.equal(error.message, '无法确认文章封面已保存，请检查草稿。');
+        assert.equal(error.details.article_id, '123');
+        return true;
+      });
+      if (options.noCoverSave) assert.equal(Date.now() - start, 60150);
+    });
+    assert.equal(f.calls.some(call => call[0] === 'screenshot'), false);
+    assert.equal(f.listenerCount(), 0);
+    assert.equal(f.state.closed, true);
+  }
+});
+
+test('draft cover confirmation preserves the body save marker and indicator fallback', async t => {
+  const args = await input(t, { cover: '/tmp/cover.png' });
+  for (const options of [{ coverDelay: 2000 }, { noSave: true, indicatorSave: true }]) {
+    const f = fixture(options);
+    if (options.noSave) {
+      const originalClick = f.page.click;
+      f.page.click = async function (selector) {
+        await originalClick.call(this, selector);
+        if (selector === '[data-x-poster-article="apply"]') f.response('ArticleEntityUpdateCoverMedia');
+      };
+    }
+    const result = await runClock(t, () => createArticleDraft(f.browser, args));
+    assert.equal(result.cover, true);
+    assert.equal(result.warning, undefined);
+  }
+});
+
+test('draft with confirmed cover save but no detected cover is UNCERTAIN', async t => {
+  const f = fixture({ noCover: true, extraCoverImages: ['thumbnail'] });
+  const args = await input(t, { cover: '/tmp/cover.png' });
+  await assert.rejects(runClock(t, () => createArticleDraft(f.browser, args)), error =>
+    error.code === 'UNCERTAIN' && /封面/.test(error.message));
+});
+
+test('draft rechecks a cover that appears while its image is loading', async t => {
+  const f = fixture({ noCover: true });
+  const args = await input(t, { cover: '/tmp/cover.png' });
+  const originalClick = f.page.click;
+  f.page.click = async function (selector) {
+    await originalClick.call(this, selector);
+    if (selector === '[data-x-poster-article="apply"]') setTimeout(() => { f.state.cover = true; }, 5000);
+  };
+  assert.equal((await runClock(t, () => createArticleDraft(f.browser, args))).cover, true);
+});
+
+test('redirected editors fail within five simulated seconds with operation-specific errors', async t => {
+  const args = await input(t, { cover: '/tmp/cover.png' });
+  for (const [action, code] of [[browser => setArticleCover(browser, '123', args), 'INVALID_INPUT'],
+    [browser => publishArticle(browser, '123'), 'UI_CHANGED'],
+    [browser => deleteArticleDraft(browser, '123'), 'UI_CHANGED']]) {
+    const f = fixture({ redirect: '/compose/articles' });
+    f.state.pollWaits = true;
+    await runClock(t, async () => {
+      const start = Date.now();
+      await assert.rejects(action(f.browser), error => {
+        assert.equal(error.code, code);
+        if (code === 'INVALID_INPUT') assert.equal(error.message, '文章草稿不存在或无法打开。');
+        return true;
+      });
+      assert.ok(Date.now() - start < 5000);
+      assert.equal(Date.now() - start, 2000);
+    });
+    assert.equal(f.calls.some(call => call[0] === 'files' || call[0] === 'click'), false);
+    assert.equal(f.listenerCount(), 0);
+    assert.equal(f.state.closed, true);
+  }
+});
+
+test('editor routing tolerates intermediate URLs and slow draft loading', async t => {
+  const args = await input(t, { cover: '/tmp/cover.png' });
+  for (const options of [{ redirect: '/compose/articles' }, { editorMissing: true }]) {
+    const f = fixture(options);
+    f.state.pollWaits = true;
+    await runClock(t, async () => {
+      setTimeout(() => { f.state.pathname = '/compose/articles/edit/123'; f.state.editorMissing = false; },
+        options.editorMissing ? 10000 : 1000);
+      assert.equal((await setArticleCover(f.browser, '123', args)).cover, true);
+    });
+  }
+});
+
+test('login and challenge detection take priority over editor redirects', async t => {
+  const args = await input(t, { cover: '/tmp/cover.png' });
+  for (const [redirect, code] of [['/i/flow/login', 'NOT_LOGGED_IN'], ['/account/access', 'ACCOUNT_CHALLENGE']]) {
+    const f = fixture({ redirect });
+    f.state.pollWaits = true;
+    await runClock(t, async () => {
+      const start = Date.now();
+      await assert.rejects(setArticleCover(f.browser, '123', args), error => error.code === code);
+      assert.equal(Date.now() - start, 0);
+    });
+  }
+});
+
+test('redirect stability resets while the expected editor is loading', async t => {
+  const f = fixture({ redirect: '/compose/articles', editorMissing: true, pollWaits: true });
+  const args = await input(t, { cover: '/tmp/cover.png' });
+  await runClock(t, async () => {
+    const start = Date.now();
+    setTimeout(() => { f.state.pathname = '/compose/articles/edit/123'; }, 500);
+    setTimeout(() => { f.state.pathname = '/compose/articles'; }, 1500);
+    await assert.rejects(setArticleCover(f.browser, '123', args), error => error.code === 'INVALID_INPUT');
+    assert.equal(Date.now() - start, 3500);
+  });
+});
+
+test('transport failure after upload and before confirmation remains UNCERTAIN', async t => {
+  const f = fixture({ noCoverSave: true });
+  const args = await input(t, { cover: '/tmp/cover.png' });
+  const originalClick = f.page.click;
+  f.page.click = async function (selector) {
+    await originalClick.call(this, selector);
+    if (selector === '[data-x-poster-article="apply"]') throw new Error('transport closed');
+  };
+  await assert.rejects(runClock(t, () => setArticleCover(f.browser, '123', args)), error => error.code === 'UNCERTAIN');
+  assert.equal(f.state.closed, true);
+  assert.equal(f.listenerCount(), 0);
+});
+
+test('confirmed cover survives screenshot, file write and image snapshot failures', async t => {
+  const args = await input(t, { cover: '/tmp/cover.png' });
+  for (const failure of ['screenshot', 'write', 'snapshot']) {
+    const f = fixture({ screenshotError: failure === 'screenshot' });
+    if (failure === 'snapshot') {
+      const originalCall = f.page.call;
+      f.page.call = async function (fn, ...values) {
+        if (fn.name === 'snapshot' && f.calls.some(call => call[0] === 'scroll')) throw new Error('context destroyed');
+        return originalCall.call(this, fn, ...values);
+      };
+    }
+    const result = await runClock(t, () => setArticleCover(f.browser, '123', {
+      ...args, screenshotPath: failure === 'write' ? join(args.screenshotPath, 'missing.png') : args.screenshotPath,
+    }));
+    assert.equal(result.cover, true);
+    assert.equal(result.screenshot, null);
+    assert.match(result.warning, /封面已保存.*截图.*失败/);
+    assert.equal(f.state.closed, true);
+    assert.equal(f.listenerCount(), 0);
+  }
+});
+
+test('cover MCP returns success and warning without image when screenshot fails after save', async t => {
+  const f = await toolFixture(t, { screenshotError: true });
+  const cover = join(f.dir, 'cover.png');
+  await writeFile(cover, 'image');
+  const result = await runClock(t, () => callTool('x_article_cover', { article_id: '123', cover }));
+  assert.equal(result.isError, undefined);
+  const data = JSON.parse(result.content[0].text);
+  assert.equal(data.ok, true);
+  assert.equal(data.cover, true);
+  assert.equal(data.screenshot, null);
+  assert.match(data.warning, /封面已保存.*截图.*失败/);
+  assert.equal(result.content.length, 1);
+  assert.deepEqual(await readHistory(config.historyFile), []);
+  assert.equal(f.state.browserClosed, true);
+});
+
+test('snapshot cover detection rejects icons, avatars, emoji, hidden and cover-button media', async t => {
+  const args = await input(t, { cover: '/tmp/cover.png' });
+  for (const options of [{ coverWidth: 32, coverNaturalWidth: 32 },
+    { coverWidth: 32, coverComplete: false }, { coverAriaHidden: 'true' }, { coverHiddenAncestor: true },
+    { coverSrc: 'https://pbs.twimg.com/profile_images/avatar.jpg' },
+    { coverSrc: 'https://abs.twimg.com/emoji/v2/72x72/icon.png' },
+    { mediaInCoverButton: true }]) {
+    const f = fixture({ cover: true, ...options });
+    const result = await runClock(t, () => setArticleCover(f.browser, '123', args));
+    assert.equal(result.replaced, false, JSON.stringify(options));
+  }
+});
+
+test('snapshot cover detection accepts large media and loaded natural image dimensions', async t => {
+  const args = await input(t, { cover: '/tmp/cover.png' });
+  for (const options of [{ coverWidth: 200, coverNaturalWidth: 0, coverComplete: false },
+    { coverSrc: 'blob:https://x.com/cover', coverWidth: 200 },
+    { coverTagName: 'VIDEO', coverWidth: 200 },
+    { coverWidth: 32, coverNaturalWidth: 200, coverComplete: true }]) {
+    const f = fixture({ cover: true, ...options });
+    assert.equal((await runClock(t, () => setArticleCover(f.browser, '123', args))).replaced, true);
+  }
+});
+
+test('missing article lookup fails fast for cover, publish, delete and draft creation', async t => {
+  const args = await input(t, { cover: '/tmp/cover.png' });
+  const actions = [browser => setArticleCover(browser, '123', args), browser => publishArticle(browser, '123'),
+    browser => deleteArticleDraft(browser, '123'), browser => createArticleDraft(browser, args)];
+  const keys = ['articleEntityId', 'article_id', 'articleId', 'rest_id'];
+  for (const [index, action] of actions.entries()) for (const method of ['GET', 'POST']) {
+    for (const article of [{ result: {} }, { result: null }, {}]) {
+      const f = fixture({ editorMissing: true, articleLookup: { method, delay: 500,
+        variables: { [keys[index]]: '123' }, body: { data: { article_result_by_rest_id: article } } } });
+      await runClock(t, async () => {
+        const start = Date.now();
+        await assert.rejects(action(f.browser), error => {
+          assert.equal(error.code, 'INVALID_INPUT');
+          assert.equal(error.message, '文章草稿不存在或无法打开。');
+          assert.equal(error.details.article_id, '123');
+          assert.equal(error.details.edit_url, 'https://x.com/compose/articles/edit/123');
+          return true;
+        });
+        assert.ok(Date.now() - start < 3000);
+        assert.ok(Date.now() - f.calls.find(call => call[0] === 'articleResponse')[1] <= 1000);
+      });
+      assert.equal(f.calls.some(call => call[0] === 'files' || call[0] === 'click' && call[1] !== 'create'), false);
+      assert.equal(f.listenerCount(), 0);
+      assert.equal(f.state.closed, true);
+    }
+  }
+});
+
+test('unrelated, real and failed article lookups leave a loading editor to its existing timeout', async t => {
+  const args = await input(t, { cover: '/tmp/cover.png' });
+  const empty = { data: { article_result_by_rest_id: { result: {} } } };
+  for (const lookup of [
+    { variables: { rest_id: '999' }, body: empty },
+    { body: { data: { article_result_by_rest_id: { result: { content_state: {}, cover_media: {} } } } } },
+    { body: { errors: [{ message: 'denied' }] } },
+    { body: empty, status: 500 },
+    { variables: {}, body: empty },
+  ]) {
+    const f = fixture({ editorMissing: true, articleLookup: { variables: { rest_id: '123' }, ...lookup } });
+    await runClock(t, async () => {
+      const start = Date.now();
+      await assert.rejects(setArticleCover(f.browser, '123', args), error => error.code === 'UI_CHANGED');
+      assert.equal(Date.now() - start, 30000);
+    });
+    assert.equal(f.listenerCount(), 0);
+    assert.equal(f.state.closed, true);
+  }
+});
+
+test('GET article lookup preserves a nineteen-digit id from URL variables', async t => {
+  const id = '1234567890123456789';
+  const f = fixture({ editorMissing: true, articleLookup: { variables: { rest_id: id },
+    body: { data: { article_result_by_rest_id: { result: {} } } } } });
+  const args = await input(t, { cover: '/tmp/cover.png' });
+  await runClock(t, async () => {
+    const start = Date.now();
+    await assert.rejects(setArticleCover(f.browser, id, args), error => {
+      assert.equal(error.code, 'INVALID_INPUT');
+      assert.equal(error.details.article_id, id);
+      assert.equal(error.details.edit_url, `https://x.com/compose/articles/edit/${id}`);
+      return true;
+    });
+    assert.ok(Date.now() - start < 3000);
+  });
+});
+
+test('real article lookup permits a slow editor to finish loading', async t => {
+  const f = fixture({ editorMissing: true, articleLookup: { variables: { rest_id: '123' },
+    body: { data: { article_result_by_rest_id: { result: { content_state: {}, cover_media: {} } } } } } });
+  const args = await input(t, { cover: '/tmp/cover.png' });
+  await runClock(t, async () => {
+    setTimeout(() => { f.state.editorMissing = false; }, 5000);
+    assert.equal((await setArticleCover(f.browser, '123', args)).cover, true);
+  });
+});
+
+test('login, challenge and published detection retain priority over missing article lookup', async t => {
+  const args = await input(t, { cover: '/tmp/cover.png' });
+  for (const [options, code, message] of [
+    [{ redirect: '/i/flow/login' }, 'NOT_LOGGED_IN', /登录/],
+    [{ redirect: '/account/access' }, 'ACCOUNT_CHALLENGE', /验证/],
+    [{ published: true }, 'INVALID_INPUT', /该文章已发布/],
+  ]) {
+    const f = fixture({ ...options, articleLookup: { variables: { rest_id: '123' },
+      body: { data: { article_result_by_rest_id: { result: {} } } } } });
+    await runClock(t, async () => {
+      const start = Date.now();
+      await assert.rejects(setArticleCover(f.browser, '123', args), error => error.code === code && message.test(error.message));
+      assert.equal(Date.now() - start, 0);
+    });
+    assert.equal(f.listenerCount(), 0);
+  }
 });

@@ -373,7 +373,7 @@ async function runArticle(args, mode) {
       if (mode === 'cover') {
         const screenshotPath = join(config.previewsDir, `${new Date().toISOString().replace(/[:.]/g, '-')}-article-cover.png`);
         const { screenshot, ...result } = await setArticleCover(browser, input.articleId, { cover: input.cover, screenshotPath });
-        return { data: { ok: true, ...result, screenshot: screenshotPath }, image: screenshot };
+        return { data: { ok: true, ...result, screenshot: screenshot ? screenshotPath : null }, image: screenshot };
       }
       let result;
       try {
@@ -516,7 +516,7 @@ export async function callTool(name, args) {
     if (!hasTool(name)) throw new XPosterError('INVALID_INPUT', '未知工具。');
     const { data, image } = await handlers[name](args);
     const content = [{ type: 'text', text: JSON.stringify(data, null, 2) }];
-    if (image) content.push({ type: 'image', data: image.toString('base64'), mimeType: 'image/png' });
+    if (Buffer.isBuffer(image)) content.push({ type: 'image', data: image.toString('base64'), mimeType: 'image/png' });
     return { content };
   } catch (error) {
     let reported = error;

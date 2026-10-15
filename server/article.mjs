@@ -25,6 +25,11 @@ function uncertain(id, message = '无法确认文章操作是否完成。') {
   });
 }
 
+function requestArticleId(record) {
+  return String(record.variables?.articleEntityId ?? record.variables?.article_id
+    ?? record.variables?.articleId ?? record.variables?.rest_id ?? '');
+}
+
 function watchRequests(page) {
   const requests = new Map();
   let sequence = 0;
@@ -33,9 +38,12 @@ function watchRequests(page) {
   const off = [];
   off.push(page.on('Network.requestWillBeSent', ({ requestId, request }) => {
     const operation = request.url.match(/^https:\/\/x\.com\/i\/api\/graphql\/[^/]+\/(Article\w+)\b/)?.[1];
-    if (!operation || request.method !== 'POST') return;
+    if (!operation || request.method !== 'POST' && !(request.method === 'GET' && operation === 'ArticleEntityResultByRestId')) return;
     let variables;
-    try { variables = JSON.parse(request.postData).variables; } catch { /* Uncorrelated mutations cannot prove success. */ }
+    try { variables = JSON.parse(request.postData).variables; } catch { /* GET requests carry variables in the URL. */ }
+    if (!variables) {
+      try { variables = JSON.parse(new URL(request.url).searchParams.get('variables')); } catch { /* Uncorrelated requests cannot prove an article's state. */ }
+    }
     const record = { requestId, operation, variables, sequence: ++sequence, done: false, ok: false };
     requests.set(requestId, record);
     if (/^ArticleEntityUpdate/.test(operation)) lastUpdateAt = Date.now();
@@ -67,35 +75,58 @@ function watchRequests(page) {
     updates: after => [...requests.values()].filter(record => record.sequence > after && /^ArticleEntityUpdate/.test(record.operation)),
     lastUpdateAt: () => lastUpdateAt,
     mutation: (pattern, id, after = 0) => [...requests.values()].find(record => record.sequence > after && pattern.test(record.operation)
-      && String(record.variables?.articleEntityId ?? record.variables?.article_id ?? record.variables?.articleId ?? '') === id && record.done),
+      && requestArticleId(record) === id && record.done),
+    missingArticle: id => [...requests.values()].some(record => {
+      if (record.operation !== 'ArticleEntityResultByRestId' || requestArticleId(record) !== id || !record.done || !record.ok) return false;
+      const result = record.body.data.article_result_by_rest_id?.result;
+      return result == null || typeof result === 'object' && !Array.isArray(result) && Object.keys(result).length === 0;
+    }),
     stop() { stopped = true; off.forEach(unsubscribe => unsubscribe()); },
   };
 }
 
-async function waitEditor(page, id, operation) {
+async function waitEditor(page, watcher, id, operation) {
   const existingDraft = operation === 'cover';
-  const ready = await page.waitFor((selectors, expectedId) => {
-    if (/\/i\/flow\/login/.test(location.pathname)) return 'login';
-    if (/\/account\/access/.test(location.pathname)) return 'challenge';
-    const title = [...document.querySelectorAll('textarea')].find(el => /标题|title/i.test(el.placeholder));
-    if (location.pathname !== `/compose/articles/edit/${expectedId}`) return null;
-    const composer = document.querySelector(selectors.composer);
-    if (title && composer) return 'ready';
-    // The left article list also says "Published"; require the reader's Unpublish control.
-    const reader = document.querySelector('main, [role=main]');
-    if (!title && !composer && reader && [...reader.querySelectorAll('button, [role=button], [role=menuitem]')]
-      .some(el => !el.closest(selectors.dialog) && /^(取消发布(?:[，,、].*)?|Unpublish\b.*)$/i
-        .test((el.innerText || el.textContent || el.getAttribute('aria-label') || '').trim()))) return 'published';
-    return null;
-  }, [ARTICLE_SELECTORS, id]);
+  const deadline = Date.now() + 30000;
+  let ready;
+  let route;
+  let routeSince;
+  do {
+    ready = await page.waitFor((selectors, expectedId) => {
+      if (/\/i\/flow\/login/.test(location.pathname)) return 'login';
+      if (/\/account\/access/.test(location.pathname)) return 'challenge';
+      const title = [...document.querySelectorAll('textarea')].find(el => /标题|title/i.test(el.placeholder));
+      if (location.pathname !== `/compose/articles/edit/${expectedId}`) return location.pathname;
+      const composer = document.querySelector(selectors.composer);
+      if (title && composer) return 'ready';
+      // The left article list also says "Published"; require the reader's Unpublish control.
+      const reader = document.querySelector('main, [role=main]');
+      if (!title && !composer && reader && [...reader.querySelectorAll('button, [role=button], [role=menuitem]')]
+        .some(el => !el.closest(selectors.dialog) && /^(取消发布(?:[，,、].*)?|Unpublish\b.*)$/i
+          .test((el.innerText || el.textContent || el.getAttribute('aria-label') || '').trim()))) return 'published';
+      return 'loading';
+    }, [ARTICLE_SELECTORS, id], { timeout: Math.max(0, deadline - Date.now()) });
+    if (ready === 'login' || ready === 'challenge' || ready === 'published') break;
+    if (watcher.missingArticle(id)) { ready = 'missing'; break; }
+    if (ready === 'loading') route = null;
+    else {
+      if (!ready?.startsWith('/')) break;
+      // Client-side routing may briefly visit the article list before opening the editor.
+      if (ready !== route) { route = ready; routeSince = Date.now(); }
+      if (Date.now() - routeSince >= 2000) { ready = 'redirected'; break; }
+    }
+    if (Date.now() >= deadline) break;
+    await delay(250);
+  } while (true);
   if (ready === 'login') throw new XPosterError('NOT_LOGGED_IN', 'X 登录已过期，请调用 x_login 让用户自行登录。');
   if (ready === 'challenge') throw new XPosterError('ACCOUNT_CHALLENGE', 'X 要求验证，请让用户在普通登录窗口中自行处理。');
+  if (ready === 'missing') throw new XPosterError('INVALID_INPUT', '文章草稿不存在或无法打开。', { article_id: id, edit_url: editURL(id) });
   if (ready === 'published') {
     const message = existingDraft ? '该文章已发布，x_article_cover 只能用于草稿。如需更换已发布文章的封面，请让用户在 X 网页上操作。'
       : operation === 'delete' ? '该文章已发布，x_article_delete 只删除草稿。' : '该文章已发布。';
     throw new XPosterError('INVALID_INPUT', message, { article_id: id, edit_url: editURL(id) });
   }
-  if (existingDraft && await page.call(() => location.pathname) !== `/compose/articles/edit/${id}`) {
+  if (existingDraft && (ready === 'redirected' || await page.call(() => location.pathname) !== `/compose/articles/edit/${id}`)) {
     throw new XPosterError('INVALID_INPUT', '文章草稿不存在或无法打开。');
   }
   if (ready !== 'ready') throw new XPosterError('UI_CHANGED', '文章编辑器未加载或文章 id 不匹配。', { edit_url: editURL(id) });
@@ -176,7 +207,14 @@ function snapshot(selectors) {
   const coverMedia = [];
   const cover = anchors.some(anchor => {
     for (let area = anchor; area && !area.contains(composer) && !area.querySelector('textarea'); area = area.parentElement) {
-      const media = [...area.querySelectorAll('img, video')].filter(el => !el.closest(selectors.dialog) && !el.closest(selectors.composer));
+      const media = [...area.querySelectorAll('img, video')].filter(el => {
+        const src = el.currentSrc || el.src || '';
+        if (el.closest(selectors.dialog) || el.closest(selectors.composer) || el.closest(selectors.cover)
+          || el.getAttribute('aria-hidden') === 'true' || el.closest('[aria-hidden="true"]')
+          || /profile_images|\/emoji\//i.test(src)) return false;
+        return el.getBoundingClientRect().width >= 200
+          || el.tagName === 'IMG' && el.complete && el.naturalWidth >= 200;
+      });
       if (media.length) { coverMedia.push(...media); return true; }
     }
     return false;
@@ -301,7 +339,7 @@ export async function createArticleDraft(browser, { title, segments, cover, scre
     await page.click(ARTICLE_SELECTORS.create);
     articleId = await page.waitFor(() => location.pathname.match(/^\/compose\/articles\/edit\/(\d+)$/)?.[1]);
     if (!articleId) throw new XPosterError('UNCERTAIN', '无法确认新文章草稿的 id。', { hint: `不要自动重试，请检查 ${ARTICLES_URL} 的草稿。` });
-    await waitEditor(page, articleId);
+    await waitEditor(page, watcher, articleId);
     await page.call(() => {
       const title = [...document.querySelectorAll('textarea')].find(el => /标题|title/i.test(el.placeholder));
       title.focus();
@@ -334,21 +372,24 @@ export async function createArticleDraft(browser, { title, segments, cover, scre
     }
     await page.press('Escape');
     if (cover) {
-      savedBefore = (await page.call(snapshot, ARTICLE_SELECTORS)).saved;
       lastEdit = Date.now();
+      const coverMark = watcher.mark();
       await insertCover(page, cover);
+      const response = await waitMutation(watcher, /^ArticleEntityUpdateCoverMedia$/, articleId, 60000, coverMark);
+      if (!response?.ok) throw uncertain(articleId, '无法确认文章封面已保存，请检查草稿。');
     }
-    const final = await waitSaved(page, watcher, mark, savedBefore, lastEdit, articleId);
+    let final = await waitSaved(page, watcher, mark, savedBefore, lastEdit, articleId);
     const expected = segments.reduce((sum, segment) => sum + (segment.paths?.length ?? 0), 0);
-    if (final.title !== title || !final.text.trim() && !final.images || final.images !== expected) {
-      throw uncertain(articleId, '文章标题、正文、图片数量或封面与预期不一致，请检查草稿。');
-    }
     await page.call(selector => { window.scrollTo(0, 0); document.querySelector(selector)?.scrollIntoView({ block: 'start' }); }, 'textarea');
     const warning = cover ? await waitCoverImage(page) : undefined;
+    if (cover) final = await page.call(snapshot, ARTICLE_SELECTORS);
+    if (final.title !== title || !final.text.trim() && !final.images || final.images !== expected || !!cover && !final.cover) {
+      throw uncertain(articleId, '文章标题、正文、图片数量或封面与预期不一致，请检查草稿。');
+    }
     const screenshot = await page.screenshot();
     await writeFile(screenshotPath, screenshot, { mode: 0o600 });
     return { article_id: articleId, edit_url: editURL(articleId), title, images_inserted: final.images,
-      images_expected: expected, cover: !!cover || final.cover, word_count_text: final.wordCount, screenshot, ...(warning ? { warning } : {}) };
+      images_expected: expected, cover: final.cover, word_count_text: final.wordCount, screenshot, ...(warning ? { warning } : {}) };
   } catch (error) {
     if (articleId) {
       if (!(error instanceof XPosterError)) throw uncertain(articleId, '已创建文章草稿，但后续操作未完成，请检查草稿。');
@@ -368,7 +409,7 @@ export async function setArticleCover(browser, articleId, { cover, screenshotPat
   try {
     await page.send('Network.enable');
     await page.navigate(editURL(articleId));
-    await waitEditor(page, articleId, 'cover');
+    await waitEditor(page, watcher, articleId, 'cover');
     const replaced = (await page.call(snapshot, ARTICLE_SELECTORS)).cover;
     const mark = watcher.mark();
     attempted = true;
@@ -376,10 +417,17 @@ export async function setArticleCover(browser, articleId, { cover, screenshotPat
     const response = await waitMutation(watcher, /^ArticleEntityUpdateCoverMedia$/, articleId, 60000, mark);
     // GraphQL errors also leave the save unconfirmed: report UNCERTAIN, never retry automatically.
     if (!response?.ok) throw uncertain(articleId, '无法确认文章封面已保存。');
-    await page.call(() => window.scrollTo(0, 0));
-    const warning = await waitCoverImage(page);
-    const screenshot = await page.screenshot();
-    await writeFile(screenshotPath, screenshot, { mode: 0o600 });
+    let warning;
+    let screenshot = null;
+    try {
+      await page.call(() => window.scrollTo(0, 0));
+      warning = await waitCoverImage(page);
+      const image = await page.screenshot();
+      await writeFile(screenshotPath, image, { mode: 0o600 });
+      screenshot = image;
+    } catch {
+      warning = '封面已保存，但截图失败，请打开草稿查看封面。';
+    }
     return { article_id: articleId, edit_url: editURL(articleId), replaced, cover: true, screenshot, ...(warning ? { warning } : {}) };
   } catch (error) {
     if (attempted && !(error instanceof XPosterError)) throw uncertain(articleId, '文章封面操作未完成，请检查草稿。');
@@ -425,7 +473,7 @@ export async function publishArticle(browser, articleId) {
   try {
     await page.send('Network.enable');
     await page.navigate(editURL(articleId));
-    await waitEditor(page, articleId, 'publish');
+    await waitEditor(page, watcher, articleId, 'publish');
     if (!(await page.call(snapshot, ARTICLE_SELECTORS)).title.trim()) {
       throw new XPosterError('INVALID_INPUT', '文章标题不能为空。');
     }
@@ -462,7 +510,7 @@ export async function deleteArticleDraft(browser, articleId) {
   try {
     await page.send('Network.enable');
     await page.navigate(editURL(articleId));
-    await waitEditor(page, articleId, 'delete');
+    await waitEditor(page, watcher, articleId, 'delete');
     await page.press('Escape');
     await clickAction(page, 'more');
     if (!await page.waitFor(selector => !!document.querySelector(selector), [ARTICLE_SELECTORS.menuItem], { timeout: 10000 })) {
