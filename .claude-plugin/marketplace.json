@@ -1,0 +1,12 @@
+{
+  "name": "x-poster",
+  "owner": { "name": "dghd7639-netizen" },
+  "description": "通过本机 Chrome 预览并发布 X 推文的 AI agent 插件市场",
+  "plugins": [
+    {
+      "name": "x-poster",
+      "source": "./",
+      "description": "让 AI agent 通过本机 Chrome 在 X 发布推文，支持最多 4 张图片，先预览确认再发布"
+    }
+  ]
+}

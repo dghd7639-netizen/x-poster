@@ -1,0 +1,85 @@
+#!/usr/bin/env node
+import { parseArgs } from 'node:util';
+import { resolve } from 'node:path';
+import { expandHome } from './config.mjs';
+import { XPosterError } from './errors.mjs';
+import { status, preview, post, openUserWindow } from './tools.mjs';
+
+const usage = `x-poster 命令行（需要 Node.js 22 或更高版本）
+
+用法：node server/cli.mjs <命令> [选项]
+
+命令：
+  status   查看登录状态和发布限制
+  login    打开普通 Chrome 供用户自行登录，等待用户完全退出该 Chrome
+  open     打开普通 Chrome 登录或检查账号，等待用户完全退出该 Chrome
+  preview  填写并截图预览，不发布
+  post     发布已经由用户确认的文字和图片
+
+选项：
+  --text <文字>     文字中的字面量 \\n 会转换为换行
+  --image <路径>    可重复使用，最多 4 张；支持绝对路径、相对路径和 ~
+  -h, --help        显示帮助
+
+先预览，再请用户确认，最后用完全相同的内容发布。
+登录可使用 Google/Apple 账号；完成后按 Cmd+Q 完全退出该 Chrome（Windows/Linux 关闭它的所有窗口）。
+请勿索要或代填密码；遇到 UNCERTAIN 不要重试，请用户检查主页。
+`;
+
+function print(value) { process.stdout.write(`${JSON.stringify(value, null, 2)}\n`); }
+
+async function main() {
+  if (globalThis.WebSocket === undefined) {
+    throw new XPosterError('INVALID_INPUT', 'x-poster 需要 Node.js 22 或更高版本');
+  }
+  let values;
+  let positionals;
+  try {
+    ({ values, positionals } = parseArgs({
+      allowPositionals: true,
+      options: {
+        text: { type: 'string' }, image: { type: 'string', multiple: true },
+        help: { type: 'boolean', short: 'h' },
+      },
+    }));
+  } catch { throw new XPosterError('INVALID_INPUT', '命令行参数无效。', { hint: '使用 --help 查看用法。' }); }
+  if (values.help || positionals.length === 0) {
+    process.stdout.write(usage);
+    return 0;
+  }
+  if (positionals.length !== 1) throw new XPosterError('INVALID_INPUT', '请只指定一个命令。');
+  const [command] = positionals;
+  const input = {
+    text: values.text?.replace(/\\n/g, '\n'),
+    images: (values.image ?? []).map(path => resolve(expandHome(path))),
+  };
+  switch (command) {
+    case 'status': print((await status()).data); return 0;
+    case 'login': {
+      const current = (await status()).data;
+      if (current.logged_in) { print({ ...current, message: '当前已登录 X。' }); return 0; }
+      const { done } = await openUserWindow();
+      console.error('已打开普通 Chrome 窗口。请在窗口中自行登录 X（可使用 Google/Apple 账号，包括两步验证）。登录完成后按 Cmd+Q 完全退出该 Chrome（Windows/Linux 关闭它的所有窗口），本命令会自动确认登录状态。');
+      const outcome = await done;
+      print(outcome);
+      return outcome.logged_in ? 0 : 1;
+    }
+    case 'open': {
+      const { done } = await openUserWindow();
+      console.error('已打开普通 Chrome 窗口。请在窗口中自行登录 X 或处理验证提示（可使用 Google/Apple 账号）。完成后按 Cmd+Q 完全退出该 Chrome（Windows/Linux 关闭它的所有窗口），本命令会自动确认登录状态。');
+      print(await done);
+      return 0;
+    }
+    case 'preview': print((await preview(input)).data); return 0;
+    case 'post': print((await post(input)).data); return 0;
+    default: throw new XPosterError('INVALID_INPUT', '未知命令。', { hint: '使用 --help 查看用法。' });
+  }
+}
+
+try { process.exit(await main()); }
+catch (error) {
+  if (!(error instanceof XPosterError)) console.error('x-poster 内部错误：', error);
+  const reported = error instanceof XPosterError ? error : new XPosterError('INTERNAL_ERROR', '发生内部错误。');
+  process.stderr.write(`${JSON.stringify({ ok: false, ...reported.toJSON() }, null, 2)}\n`);
+  process.exit(1);
+}

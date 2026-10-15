@@ -1,0 +1,9 @@
+{
+  "name": "x-poster",
+  "version": "0.1.0",
+  "description": "Zero-dependency MCP tools for previewing and publishing X posts with a dedicated local Chrome profile.",
+  "type": "module",
+  "private": true,
+  "engines": { "node": ">=22" },
+  "scripts": { "test": "node --test", "start": "node server/index.mjs" }
+}

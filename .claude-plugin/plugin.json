@@ -1,0 +1,11 @@
+{
+  "name": "x-poster",
+  "displayName": "X Poster",
+  "version": "0.1.0",
+  "description": "让 AI agent 通过本机 Chrome 在 X 发布推文，支持最多 4 张图片，先预览确认再发布",
+  "author": { "name": "dghd7639-netizen" },
+  "keywords": ["x", "twitter", "browser", "mcp", "social-media"],
+  "mcpServers": {
+    "x-poster": { "command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/server/index.mjs"] }
+  }
+}

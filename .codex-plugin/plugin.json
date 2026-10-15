@@ -1,0 +1,18 @@
+{
+  "name": "x-poster",
+  "version": "0.1.0",
+  "description": "让 AI agent 通过本机 Chrome 在 X 发布推文，支持最多 4 张图片，先预览确认再发布",
+  "author": { "name": "dghd7639-netizen" },
+  "keywords": ["x", "twitter", "browser", "mcp"],
+  "skills": "./skills/",
+  "mcpServers": "./.codex-mcp.json",
+  "interface": {
+    "displayName": "X Poster",
+    "shortDescription": "在本机预览、确认并发布 X 推文",
+    "longDescription": "通过本机 Chrome 发布文字和最多 4 张本地图片。先展示预览并等待用户确认，Claude Code 与 Codex 共用登录态。",
+    "developerName": "dghd7639-netizen",
+    "category": "Productivity",
+    "capabilities": ["Interactive", "Write"],
+    "defaultPrompt": ["帮我预览一条推文：今天天气真好"]
+  }
+}
