@@ -1,11 +1,13 @@
-import { mkdir, readdir, stat, unlink } from 'node:fs/promises';
-import { join } from 'node:path';
+import { mkdir, readdir, stat, unlink, open } from 'node:fs/promises';
+import { join, dirname, isAbsolute, extname } from 'node:path';
 import { Browser, findChrome, openPlainWindow } from './chrome.mjs';
 import { config, ensureHome, loadState, saveState } from './config.mjs';
 import { XPosterError } from './errors.mjs';
 import { appendHistory, checkRateLimit, readHistory } from './limits.mjs';
 import { MAX_WEIGHTED_LENGTH, validatePostInput, parseScheduledAt } from './validate.mjs';
 import { compose, listScheduled as readScheduled, cancelScheduled as deleteScheduled, URLS } from './x.mjs';
+import { parseArticleMarkdown, MAX_MARKDOWN_BYTES } from './markdown.mjs';
+import { createArticleDraft, publishArticle, deleteArticleDraft } from './article.mjs';
 
 let queue = Promise.resolve();
 export function exclusive(fn) {
@@ -285,6 +287,110 @@ export function cancelScheduled(args) {
   });
 }
 
+function articleIdInput(args) {
+  if (!args || typeof args !== 'object' || Array.isArray(args) || typeof args.article_id !== 'string'
+    || !args.article_id || /\D/.test(args.article_id) || Object.keys(args).some(key => key !== 'article_id')) {
+    throw new XPosterError('INVALID_INPUT', 'article_id 必须是文章的纯数字字符串。');
+  }
+  return args.article_id;
+}
+
+async function articleDraftInput(args) {
+  if (!args || typeof args !== 'object' || Array.isArray(args)
+    || Object.keys(args).some(key => !['markdown_path', 'title', 'cover'].includes(key))) {
+    throw new XPosterError('INVALID_INPUT', '文章参数必须是包含 markdown_path 的对象。');
+  }
+  if (typeof args.markdown_path !== 'string' || !isAbsolute(args.markdown_path) || extname(args.markdown_path).toLowerCase() !== '.md') {
+    throw new XPosterError('INVALID_INPUT', 'markdown_path 必须是本地 .md 文件的绝对路径。');
+  }
+  if (args.title !== undefined && (typeof args.title !== 'string' || !args.title.trim())) {
+    throw new XPosterError('INVALID_INPUT', '文章 title 必须是非空字符串。');
+  }
+  if (args.cover !== undefined && (typeof args.cover !== 'string' || !isAbsolute(args.cover))) {
+    throw new XPosterError('INVALID_INPUT', '文章 cover 必须是本地图片的绝对路径。');
+  }
+  let source;
+  let file;
+  try {
+    file = await open(args.markdown_path, 'r');
+    const info = await file.stat();
+    if (!info.isFile() || info.size > MAX_MARKDOWN_BYTES) {
+      throw new XPosterError('INVALID_INPUT', 'Markdown 必须是最多 1 MB 的普通文件。');
+    }
+    // Read at most one byte past the limit, even if the file grows after stat.
+    const buffer = Buffer.alloc(MAX_MARKDOWN_BYTES + 1);
+    let size = 0;
+    while (size < buffer.length) {
+      const { bytesRead } = await file.read(buffer, size, buffer.length - size, size);
+      if (!bytesRead) break;
+      size += bytesRead;
+    }
+    if (size > MAX_MARKDOWN_BYTES) throw new XPosterError('INVALID_INPUT', 'Markdown 文件不能超过 1 MB。');
+    source = buffer.subarray(0, size).toString('utf8');
+  } catch (error) {
+    if (error instanceof XPosterError) throw error;
+    throw new XPosterError('INVALID_INPUT', `无法读取 Markdown 文件：${args.markdown_path}`);
+  } finally { await file?.close(); }
+  return parseArticleMarkdown(source, { baseDir: dirname(args.markdown_path), title: args.title, cover: args.cover });
+}
+
+async function runArticle(args, mode) {
+  const input = mode === 'draft' ? await articleDraftInput(args) : { articleId: articleIdInput(args) };
+  return exclusive(async () => {
+    requireUserWindowClosed();
+    if (mode === 'publish') {
+      const rate = limits(await readHistory(config.historyFile));
+      if (!rate.allowed) throw new XPosterError('RATE_LIMITED', `请等待 ${rate.retryAfterSec} 秒后再发布文章。`, {
+        retry_after_sec: rate.retryAfterSec, posts_last_24h: rate.postsLast24h, hint: '请告诉用户等待时间，不要循环重试。',
+      });
+    }
+    if (mode === 'draft') await preparePreviews();
+    const browser = await openBrowser(config.headless);
+    try {
+      if (!await browser.isLoggedIn()) throw new XPosterError('NOT_LOGGED_IN', '尚未登录 X。', {
+        hint: '请调用 x_login，让用户自己在 Chrome 窗口中登录。',
+      });
+      if (mode === 'draft') {
+        const screenshotPath = join(config.previewsDir, `${new Date().toISOString().replace(/[:.]/g, '-')}-article.png`);
+        const { screenshot, ...result } = await createArticleDraft(browser, { ...input, screenshotPath });
+        return { data: { ok: true, ...result, screenshot: screenshotPath, warnings: input.warnings,
+          next_step: '已创建新草稿，尚未发布。请向用户展示截图、标题、warnings 和 edit_url；用户也可打开 edit_url 审阅。仅在用户明确确认这一 article_id 后调用 x_article_publish。用户只要草稿时到此停止。',
+        }, image: screenshot };
+      }
+      let result;
+      try {
+        result = mode === 'publish' ? await publishArticle(browser, input.articleId) : await deleteArticleDraft(browser, input.articleId);
+      } catch (error) {
+        if (mode === 'publish' && error.code === 'UNCERTAIN') {
+          await appendHistory(config.historyFile, { ts: new Date().toISOString(), article_id: input.articleId, uncertain: true })
+            .catch(failure => console.error('保存不确定文章发布记录失败：', failure));
+        }
+        throw error;
+      }
+      try {
+        await appendHistory(config.historyFile, { ts: new Date().toISOString(), ...(mode === 'delete'
+          ? { deleted_article: input.articleId } : { article_id: result.article_id, ...(result.url ? { url: result.url } : {}) }) });
+      } catch (error) {
+        console.error('保存文章历史记录失败：', error);
+        throw new XPosterError('UNCERTAIN', 'X 文章操作已核验成功，但本地历史记录保存失败。', {
+          article_id: input.articleId, ...(result.url ? { url: result.url } : {}),
+          hint: '不要自动重试。请检查 https://x.com/compose/articles 和数据目录权限。',
+        });
+      }
+      return { data: { ok: true, ...result } };
+    } finally { await browser.close().catch(error => console.error('关闭浏览器失败：', error)); }
+  });
+}
+
+export function articleDraft(args) { return runArticle(args, 'draft'); }
+export function articlePublish(args) { return runArticle(args, 'publish'); }
+export function articleDelete(args) { return runArticle(args, 'delete'); }
+
+const articleIdSchema = {
+  type: 'object', properties: { article_id: { type: 'string', pattern: '^\\d+$', description: 'Exact numeric article id from x_article_draft, or explicitly supplied by the user.' } },
+  required: ['article_id'], additionalProperties: false,
+};
+
 const postSchema = {
   type: 'object',
   properties: {
@@ -349,9 +455,32 @@ export const TOOLS = [
     inputSchema: { type: 'object', properties: { id: { type: 'string', pattern: '^\\d+$', description: 'Numeric scheduled-post id returned by x_list_scheduled.' } }, required: ['id'], additionalProperties: false },
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
   },
+  {
+    name: 'x_article_draft',
+    description: 'Create a NEW X Article draft from an absolute local Markdown file (eligible Premium account required). Never edit existing drafts. Relative local images resolve against the Markdown directory; remote images are skipped with warnings. Always create the draft first as the preview: show the screenshot, title, warnings and edit_url to the user. Only after explicit confirmation of this exact draft call x_article_publish with its article_id; stop for draft-only requests. Never retry UNCERTAIN without user review.',
+    inputSchema: { type: 'object', properties: {
+      markdown_path: { type: 'string', description: 'Absolute local .md file path; maximum 1 MB, up to 50 body images.' },
+      title: { type: 'string', description: 'Optional title override, ahead of front matter title and the first # heading.' },
+      cover: { type: 'string', description: 'Optional absolute local jpg/jpeg/png/webp cover path, overrides front matter cover.' },
+    }, required: ['markdown_path'], additionalProperties: false },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+  },
+  {
+    name: 'x_article_publish',
+    description: 'PUBLICLY publish one X Article draft. First create it with x_article_draft, show its screenshot, title, warnings and edit_url, and obtain explicit user confirmation of that exact article_id. Counts toward local posting limits. Never retry UNCERTAIN: ask the user to check the Published tab at https://x.com/compose/articles to avoid duplicates.',
+    inputSchema: articleIdSchema,
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+  },
+  {
+    name: 'x_article_delete',
+    description: 'Permanently delete one X Article DRAFT. Only delete drafts this session created, or an article_id the user explicitly supplied and confirmed. Show the exact id/edit_url and obtain confirmation first; never guess or select another draft. Does not count toward posting limits. Never retry UNCERTAIN: ask the user to check https://x.com/compose/articles.',
+    inputSchema: articleIdSchema,
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+  },
 ];
 
-const handlers = { x_status: status, x_login: login, x_preview: preview, x_post: post, x_schedule: schedule, x_list_scheduled: listScheduled, x_cancel_scheduled: cancelScheduled };
+const handlers = { x_status: status, x_login: login, x_preview: preview, x_post: post, x_schedule: schedule, x_list_scheduled: listScheduled, x_cancel_scheduled: cancelScheduled,
+  x_article_draft: articleDraft, x_article_publish: articlePublish, x_article_delete: articleDelete };
 export function hasTool(name) { return Object.hasOwn(handlers, name); }
 
 export async function callTool(name, args) {

@@ -397,6 +397,8 @@ export class Page {
     const keys = {
       Enter: { key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, text: '\r' },
       Backspace: { key: 'Backspace', code: 'Backspace', windowsVirtualKeyCode: 8 },
+      Escape: { key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 },
+      DocumentEnd: { key: 'End', code: 'End', windowsVirtualKeyCode: 35, commands: ['moveToEndOfDocument'] },
       SelectAll: { key: 'a', code: 'KeyA', windowsVirtualKeyCode: 65,
         modifiers: process.platform === 'darwin' ? 4 : 2, commands: ['selectAll'] },
     };

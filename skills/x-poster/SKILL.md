@@ -1,9 +1,9 @@
 ---
 name: x-poster
 description: >-
-  通过本机 Chrome 预览、发布和预排期 X 推文，支持文字和最多 4 张本地图片。
+  通过本机 Chrome 预览、发布和预排期 X 推文，以及从 Markdown 创建、发布和删除 X 长文章草稿。
   用户说“发推”“发 X”“发推特”“把这段话/这张图发到 X”（包括“把这段话发到 X”“把这张图发到 X”）、
-  “post to X”“post on Twitter”或“tweet this”时使用；调用 x_status、x_login、x_preview、x_post、x_schedule、x_list_scheduled、x_cancel_scheduled 七个 MCP 工具。
+  “post to X”“post on Twitter”“tweet this”“发布 X 文章”或“Markdown 转 X Article”时使用；提供推文、排期和文章的十个 MCP 工具。
 ---
 
 # X 推文发布
@@ -57,11 +57,28 @@ description: >-
 
 用户也可以直接在 X 网页“未发送的帖子 → 预排期”中取消。CLI 对应 `scheduled` 和 `cancel --id <id>`；先列出、展示准确文字与时间并确认，再执行取消。
 
+## 文章（X Articles）
+
+需要符合资格、具备 X Articles 权限的 Premium 账号。先按通用流程用 `x_status` 检查登录，必要时让用户自行登录并完全退出登录窗口。
+
+1. 获取本地 `.md` 文件路径。用户只给文字时，先将文字写入 `.md` 文件，保留用户内容。MCP `markdown_path` 必须是绝对路径，最多 1 MB；标题来自参数 `title`、front matter `title:` 或首个 `# `（优先级从高到低），正文不能为空。
+2. 调用 `x_article_draft({ markdown_path, title?, cover? })`，每次都会**新建**草稿，永不编辑已有草稿。正文图片使用相对于 Markdown 目录的本地路径，最多 50 张、每组最多 4 张；远程图片不下载，会跳过并警告。格式及大小遵循推文图片规则。可选封面通过 front matter `cover:` 或绝对路径参数 `cover` 提供，参数优先；仅支持 jpg/jpeg/png/webp，最多 5 MB。
+3. 展示返回的**截图、标题、所有 warnings、article_id 和 edit_url**。用户也可打开 `edit_url` 完整审阅；截图只覆盖当前视口。`##` 映射为文章“标题”，`###`–`######` 为“副标题”；嵌套列表展平，代码块和表格降级为普通段落，分割线跳过，原始 HTML 按文字处理。
+4. 询问用户是否发布**这一份草稿**，等待明确确认。用户选择“只要草稿”时立即结束。文章始终先创建草稿作为预览，即使用户提出直接发布，也需先展示并确认这个 id。
+5. 确认后调用 `x_article_publish({ article_id })`，回报返回的 id 和链接（如有）。该操作公开文章，计入与推文共用的发布额度，还需遵循 Codex 每次工具审批。
+
+用户要求修改时，优先让用户在 X 编辑；也可向用户确认删除刚创建的草稿，再调用 `x_article_delete({ article_id })`，从修改后的 Markdown 重新创建并审阅确认。不得未经确认就自动删除重建。**绝不删除插件未创建的草稿，除非用户明确提供 article_id 并确认删除该 id。** 删除不计入发布额度，也不退还原来发布的额度；Codex 每次删除需审批。
+
+遇到文章 `UNCERTAIN` 绝不重试，请用户核对返回的 `edit_url` 和 `https://x.com/compose/articles` 的“草稿／已发布”标签。保存超时时草稿可能不完整，不能继续当作已保存预览请求发布。
+
+CLI 对应 `article-draft --file <md> [--title …] [--cover <img>]`、`article-publish --id <id>`、`article-delete --id <id>`；CLI 文件路径可相对，真实发布／删除前仍需核对并确认。
+
 ## 错误处理
 
 | 错误码 | 行动 |
 |---|---|
 | `INVALID_INPUT` | 说明参数问题，核对文字、路径、格式、数量、大小和排期时间（ISO 8601、至少 5 分钟后、年份不超过当前年份加 2）；更改内容后重新预览确认；取消时核对纯数字 id，目标不存在或有同文同时间的歧义则停止。 |
+| `ARTICLES_UNAVAILABLE` | 当前账号没有新建文章入口，需要符合资格、具备 X Articles 权限的 Premium 账号；停止创建，请用户在 X 检查订阅及文章权限。 |
 | `NOT_LOGGED_IN` | 调用 `x_login`，让用户在普通 Chrome 中自行登录并按 Cmd+Q 完全退出（Windows/Linux 关闭它的所有窗口），再用 `x_status` 确认。 |
 | `LOGIN_IN_PROGRESS` | 请用户完成已有登录窗口中的操作，按 Cmd+Q 完全退出该 Chrome（Windows/Linux 关闭它的所有窗口），再调用 `x_status`；不重复启动登录。 |
 | `ACCOUNT_CHALLENGE` | 调用 `x_login` 打开普通窗口，让用户自行完成验证后完全退出该 Chrome；绝不绕过 CAPTCHA。 |
@@ -70,16 +87,16 @@ description: >-
 | `BROWSER_BUSY` | 请用户完成登录或账号检查，按 Cmd+Q 完全退出占用专用 profile 的 Chrome（Windows/Linux 关闭它的所有窗口），再调用 `x_status`。 |
 | `BROWSER_LAUNCH_FAILED` | 检查浏览器路径和启动环境，解决启动问题后再继续。 |
 | `NETWORK_ERROR` | 告知网络失败并检查连接；真实发布失败时先核对主页，避免盲目重发。 |
-| `UPLOAD_FAILED` | 检查图片与网络，重新预览确认上传完成，再请求发布。 |
+| `UPLOAD_FAILED` | 检查图片与网络；文章可能已有部分草稿，展示返回的 `edit_url`，由用户核对或确认删除重建，不能盲目重复创建。 |
 | `TEXT_REJECTED` | 解释 X 拒绝文字，核对加权长度；请用户修改或审阅新草稿后重新预览。 |
 | `POST_REJECTED` | 展示 X 的拒绝原因，例如重复内容或疑似自动化；停止发布，交由用户决定。 |
-| `UI_CHANGED` | 告知页面选择器失效，需要维护 `server/x.mjs` 中的 `SELECTORS`。 |
-| `UNCERTAIN` | **绝不重试**；请用户检查自己的 X 主页；预排期则检查 X 的“未发送的帖子 → 预排期”，确认是否已创建或取消；若其他 id 消失，立即提醒用户核查可能被误删的帖子。 |
+| `UI_CHANGED` | 告知页面选择器失效，需要维护 `server/x.mjs` 中的 `SELECTORS` 或 `server/article.mjs` 中的 `ARTICLE_SELECTORS`；已有文章 id 时先展示 `edit_url` 核对草稿。 |
+| `UNCERTAIN` | **绝不重试**；请用户检查自己的 X 主页；预排期则检查 X 的“未发送的帖子 → 预排期”，确认是否已创建或取消；若其他 id 消失，立即提醒用户核查可能被误删的帖子。文章请检查返回的 `edit_url` 和 `https://x.com/compose/articles` 的“草稿／已发布”；自动保存超时的草稿可能不完整。 |
 | `INTERNAL_ERROR` | 停止并报告意外错误；诊断时不暴露登录态等敏感数据。 |
 
 ## 规则
 
-- 只发布用户明确确认的内容；本次明确要求直接发布视为授权该次指定内容。
+- 只发布用户明确确认的内容；推文在本次明确要求直接发布时视为授权该次内容，文章始终先创建草稿并明确确认这个 id。
 - 不批量发帖、不发垃圾内容、不重复发布相同推文。
 - 遇到 `UNCERTAIN` 永不重试，即使暂时未找到推文，也交由用户核查。
 - 绝不绕过 CAPTCHA 或账号验证。

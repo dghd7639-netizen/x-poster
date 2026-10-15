@@ -2,7 +2,7 @@
 
 让 Claude Code 和 Codex 通过本机 Chrome 在 X（Twitter）发布文字和最多 4 张本地图片。默认流程为**预览 → 用户明确确认 → 发布 → 返回链接**，用户提供的文字保持原样。支持使用 **X 自带的预排期** 定时发帖，由 X 服务器到时发布，电脑可以关机。
 
-插件运行一个零依赖的 Node.js ≥ 22 MCP stdio 服务器，名称为 `x-poster`，启动命令为 `node server/index.mjs`。服务器通过 Chrome DevTools Protocol（CDP）操作专用浏览器 profile，提供 `x_status`、`x_login`、`x_preview`、`x_post`、`x_schedule`、`x_list_scheduled`、`x_cancel_scheduled` 七个工具。仓库根目录同时是两种宿主的插件根目录和市场根目录；两种宿主共用 `skills/x-poster/SKILL.md` 和默认数据目录 `~/.x-poster`，登录一次即可共用会话。
+插件运行一个零依赖的 Node.js ≥ 22 MCP stdio 服务器，名称为 `x-poster`，启动命令为 `node server/index.mjs`。服务器通过 Chrome DevTools Protocol（CDP）操作专用浏览器 profile，提供推文、预排期和 Markdown 长文章的十个工具（见工具参考）。仓库根目录同时是两种宿主的插件根目录和市场根目录；两种宿主共用 `skills/x-poster/SKILL.md` 和默认数据目录 `~/.x-poster`，登录一次即可共用会话。
 
 ## ⚠️ 风险
 
@@ -54,7 +54,7 @@ codex plugin add x-poster@x-poster
 
 仓库发布后，市场来源也可替换为 `<owner>/<repo>`。安装后重启 Codex。
 
-Codex 插件从 `.codex-mcp.json` 加载服务器配置。这里使用 `args: ["server/index.mjs"]` 和 `cwd: "."`，相对工作目录解析到安装后的插件根目录，不依赖 `${...}` 展开。`x_post`、`x_schedule` 和 `x_cancel_scheduled` 配置了 `approval_mode: "prompt"`，每次真实发布、创建或取消排期都要求宿主向用户请求审批；用户要求跳过预览时仍适用。
+Codex 插件从 `.codex-mcp.json` 加载服务器配置。这里使用 `args: ["server/index.mjs"]` 和 `cwd: "."`，相对工作目录解析到安装后的插件根目录，不依赖 `${...}` 展开。`x_post`、`x_schedule`、`x_cancel_scheduled`、`x_article_publish` 和 `x_article_delete` 配置了 `approval_mode: "prompt"`，每次真实发布、创建或取消排期、发布或删除文章都要求宿主向用户请求审批；用户要求跳过预览时仍适用。
 
 不使用插件时，可手动注册 MCP 服务器，并复制共享技能：
 
@@ -64,7 +64,7 @@ mkdir -p ~/.codex/skills
 cp -R "<本仓库路径>/skills/x-poster" ~/.codex/skills/
 ```
 
-复制前检查目标是否已有同名技能，避免覆盖。手动注册的配置不自动继承插件的逐次 `x_post` / `x_schedule` / `x_cancel_scheduled` 审批设置，需保留技能中的预览确认流程；重启 Codex 后使用。
+复制前检查目标是否已有同名技能，避免覆盖。手动注册的配置不自动继承插件的逐次工具审批设置，需保留技能中的预览确认流程；重启 Codex 后使用。
 
 ## 可选：Claude Desktop 聊天
 
@@ -129,8 +129,50 @@ agent 先调用 `x_status`，必要时引导用户登录；准备文字和本地
 | `x_schedule` | `text?`、`images?`、`scheduled_at`（必填） | 创建 X 原生预排期，返回 `scheduled: true`、`id`、`scheduled_at`、`scheduled_at_local`、`manage_url`。 |
 | `x_list_scheduled` | 无 | 返回按时间排序的 `scheduled` 和 `count`；每项含 `id`、`scheduled_at`、`text`、`media_count`、`state`（未知时为 `null`）。 |
 | `x_cancel_scheduled` | `id`（纯数字字符串） | 取消一个用户已明确确认的预排期帖；成功返回 `deleted: true`、`id` 和剩余数量 `remaining`，取消不计入发布额度。 |
+| `x_article_draft` | `markdown_path`（绝对路径）、`title?`、`cover?`（绝对路径） | 从 Markdown 新建文章草稿，返回 `article_id`、`edit_url`、标题、图片实际／预期数量、封面状态、字数文字、截图路径与图像、`warnings` 和 `next_step`；不会修改已有草稿。 |
+| `x_article_publish` | `article_id`（纯数字字符串） | 发布用户明确确认的这份草稿，返回 `article_id`，能确定链接时返回 `url`；计入发布限制。 |
+| `x_article_delete` | `article_id`（纯数字字符串） | 删除用户明确确认的草稿，核验删除响应和列表后返回 `deleted: true`；不计入发布限制。 |
 
 `text` 为字符串，`images` 为本地路径数组。预览截图默认位于 `~/.x-poster/previews/`；预览不计入真实发布额度。
+
+## 文章
+
+X Articles 是 `https://x.com/compose/articles` 的长文章编辑器，需要**具备文章权限的 X Premium 账号**；没有新建入口时返回 `ARTICLES_UNAVAILABLE`。文章始终采用 **新建草稿 → 用户审阅截图或 `edit_url` → 明确确认该 `article_id` → 发布**。草稿就是预览，不会公开；只要草稿时到此停止。不要把草稿截图当作发布成功。
+
+提供本地 `.md` 文件，最多 1 MB，正文不能为空，正文图片最多 50 张。标题优先级是工具／CLI 参数 `title` → front matter `title:` → 首个 `# ` 标题；首个 `# ` 标题会从正文移除。可选 front matter 使用简单的 `key: value`（支持成对引号），不支持完整 YAML：
+
+```markdown
+---
+title: 我的长文章
+cover: ./images/封面.webp
+---
+# 这个标题会从正文移除
+
+## 章节标题
+### 小节副标题
+
+正文支持 **粗体**、*斜体* 和 [链接](https://example.com)。
+
+![配图](<images/图片 1.png>)
+```
+
+| Markdown | 文章格式 |
+|---|---|
+| `##` | 标题（粘贴为 `<h1>`） |
+| `###`–`######` | 副标题（`<h2>`） |
+| 普通段落 | `<p>`；连续行以空格连接；行尾两个空格或反斜杠保留换行（`<br>`） |
+| `-`、`*`、`+` / `1.` 列表 | 无序／有序列表；嵌套展平并警告 |
+| `>` | 引用 |
+| `**粗体**`、`__粗体__` / `*斜体*`、`_斜体_` / `~~删除线~~` | 粗体／斜体／删除线；斜体按词边界识别 |
+| `[文字](https://…)`、`<https://…>` | HTTP(S) 链接；其他协议只保留文字 |
+| 行内反引号代码 | 保留代码文字 |
+| 独立图片行或段落中的图片 | 在对应位置插入本地图片，连续图片每组最多 4 张 |
+
+图片仅使用本地文件，路径相对于 `.md` 所在目录，也支持绝对路径、`%20` 和 `<带空格的路径>`。jpg、jpeg、png、webp 每张最多 5 MB，gif 最多 15 MB。远程 HTTP(S) 图片会跳过并警告，请先自行下载到本地。文件缺失会在启动浏览器前报错并给出路径。
+
+`---` / `***` 分割线会跳过，围栏代码块和表格降级为普通段落，原始 HTML 按文字转义；这些情况会返回 `warnings`。请在发布前核对警告与排版。封面可用 front matter `cover:`（相对 `.md` 目录），或参数 `cover`（MCP 为绝对路径、CLI 可相对路径）覆盖；封面支持 jpg、jpeg、png、webp，最多 5 MB。
+
+更改内容时可以在 X 打开 `edit_url` 手动编辑，或明确确认后用 `x_article_delete` 删除刚创建的草稿，再从修改后的 Markdown 新建。只删除本会话创建的草稿，或用户明确提供 id 并确认的草稿；绝不自动改动其他草稿。创建和删除草稿不占发布额度；文章发布与推文共用额度，删除不会退还发布额度。遇到 `UNCERTAIN` 不要重试，请检查 `edit_url` 和文章列表的“草稿／已发布”标签。
 
 ## 配置
 
@@ -179,6 +221,9 @@ codex
 | `schedule --text "…" [--image <path> …] --at <ISO>` | 创建用户已预览确认的预排期；无偏移量时使用电脑本地时区。 |
 | `scheduled` | 列出预排期帖子。 |
 | `cancel --id <id>` | 取消一个预排期帖；先列出并向用户确认准确文字和时间。 |
+| `article-draft --file <md> [--title "…"] [--cover <img>]` | 新建文章草稿并截图；文件和封面允许相对路径。 |
+| `article-publish --id <id>` | 审阅截图或 `edit_url` 并明确确认后，发布这个文章草稿。 |
+| `article-delete --id <id>` | 明确确认后删除指定草稿。 |
 
 ```bash
 node server/cli.mjs status
@@ -193,9 +238,14 @@ node server/cli.mjs schedule --text '明天见' --at '2026-10-16T09:00'
 node server/cli.mjs scheduled
 # 用户确认列表中的准确文字与时间后，将 <id> 替换为目标排期 id：
 node server/cli.mjs cancel --id '<id>'
+# 文章先创建草稿；核对返回的警告、截图或 edit_url 后再发布：
+node server/cli.mjs article-draft --file ./article.md --cover ./cover.png
+node server/cli.mjs article-publish --id '<article_id>'
+# 用户确认要删除这个草稿时：
+node server/cli.mjs article-delete --id '<article_id>'
 ```
 
-CLI 会把 `--text` 中字面的 `\n` 转为换行，并允许相对图片路径；多图重复 `--image`。纯图片可省略 `--text`。CLI `post` 直接发布，`schedule` 直接创建排期，`cancel` 直接取消指定排期，没有 agent 的预览确认对话或 Codex 的工具审批，请在执行前核对内容。
+CLI 会把 `--text` 中字面的 `\n` 转为换行，并允许相对图片路径；多图重复 `--image`。纯图片可省略 `--text`。CLI `post`、`schedule`、`cancel`、`article-publish`、`article-delete` 直接执行指定操作，没有 agent 的预览确认对话或 Codex 的工具审批，请在执行前核对内容和 id。文章必须先新建草稿并由用户确认。
 
 ## 数据与安全
 
@@ -204,7 +254,7 @@ CLI 会把 `--text` 中字面的 `\n` 转为换行，并允许相对图片路径
 | 路径 | 内容 |
 |---|---|
 | `chrome-profile/` | 专用 Chrome profile，包含敏感的 X 登录态。 |
-| `history.jsonl` | 发布、排期和取消历史；取消记录不计入发布限制。 |
+| `history.jsonl` | 推文／文章发布、排期、取消和文章删除历史；取消／删除记录不计入发布限制。 |
 | `state.json` | 本地状态。 |
 | `previews/` | 预览截图，保留 7 天。 |
 
@@ -223,6 +273,7 @@ rm -rf ~/.x-poster/chrome-profile
 | 错误或现象 | 处理方式 |
 |---|---|
 | `INVALID_INPUT` | 核对文字、图片绝对路径、数量、格式、大小、排期时间和取消 id；目标不存在或同文同时间有歧义时停止取消；CLI 可使用相对路径。 |
+| `ARTICLES_UNAVAILABLE` | 当前账号没有文章新建入口；需要符合资格、具备文章权限的 X Premium 账号。 |
 | Google 提示“此浏览器或应用可能不安全” | Google 拒绝在启用了远程调试端口的浏览器中登录。按 Cmd+Q 完全退出占用专用 profile 的 Chrome（Windows/Linux 关闭它的所有窗口），再调用 `x_login` 使用普通登录窗口。 |
 | `NOT_LOGGED_IN` / 登录过期 | 调用 `x_login`，由用户重新登录并完全退出该 Chrome，再用 `x_status` 检查。 |
 | `LOGIN_IN_PROGRESS` / `BROWSER_BUSY` | 请用户完成已有登录或检查操作，在该 Chrome 中按 Cmd+Q 完全退出（Windows/Linux 关闭它的所有窗口），再调用 `x_status`。仅关闭标签页可能仍占用专用 profile。 |
@@ -234,8 +285,8 @@ rm -rf ~/.x-poster/chrome-profile
 | `UPLOAD_FAILED` | 检查图片与连接，重新预览验证上传。 |
 | `TEXT_REJECTED` | X 未接受文字，通常是过长；核对加权长度，修改后重新预览确认。 |
 | `POST_REJECTED` | 阅读 X 返回的原因，例如重复内容或疑似自动化；停止，交由用户处理。 |
-| `UI_CHANGED` | X 页面改版，需要更新 `server/x.mjs` 的 `SELECTORS`。 |
-| `UNCERTAIN` | 无法确认是否已发出；**不要重试或重发**，请用户检查自己的主页；预排期创建或取消则检查“未发送的帖子 → 预排期”；若其他 id 消失，立即核查可能被误删的帖子。 |
+| `UI_CHANGED` | X 页面改版，需要更新 `server/x.mjs` 的 `SELECTORS` 或 `server/article.mjs` 的 `ARTICLE_SELECTORS`。 |
+| `UNCERTAIN` | 无法确认是否已发出；**不要重试或重发**，请用户检查自己的主页；预排期创建或取消则检查“未发送的帖子 → 预排期”；若其他 id 消失，立即核查可能被误删的帖子。文章则检查返回的 `edit_url` 和 `https://x.com/compose/articles` 的“草稿／已发布”标签，自动保存超时的草稿可能不完整。 |
 | `INTERNAL_ERROR` | 停止操作，检查本地错误信息；不要公开敏感登录数据。 |
 | GUI 宿主提示找不到 `node` | 确保宿主的 `PATH` 含 Node，或把 MCP 配置的 `command` 改为 Node 的绝对路径。 |
 
@@ -254,7 +305,7 @@ claude plugin validate .
 │   ├── plugin.json             Claude Code 清单，内联 MCP
 │   └── marketplace.json        Claude Code 市场
 ├── .codex-plugin/plugin.json   Codex 清单
-├── .codex-mcp.json             Codex MCP 配置，逐次审批 x_post / x_schedule / x_cancel_scheduled
+├── .codex-mcp.json             Codex MCP 配置，逐次审批真实发布、排期和删除
 ├── .agents/plugins/marketplace.json  Codex 市场
 ├── skills/x-poster/SKILL.md     两种宿主共享的使用流程
 ├── server/
@@ -262,6 +313,8 @@ claude plugin validate .
 │   ├── tools.mjs               工具定义与处理
 │   ├── chrome.mjs              浏览器启动与 CDP
 │   ├── x.mjs                   X 页面操作与 SELECTORS
+│   ├── article.mjs             长文章草稿、发布、删除与 ARTICLE_SELECTORS
+│   ├── markdown.mjs            零依赖 Markdown 解析及本地图片校验
 │   ├── validate.mjs            输入校验与加权长度
 │   ├── limits.mjs              发布历史与频率限制
 │   ├── config.mjs              环境变量与路径

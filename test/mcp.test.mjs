@@ -49,7 +49,20 @@ test('MCP handshake, listing, validation and clean stdin shutdown', { timeout: 1
   child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' })}\n`);
   child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: 'no-method' })}\n`);
   const list = await request('tools/list');
-  assert.deepEqual(list.result.tools.map(tool => tool.name), ['x_status', 'x_login', 'x_preview', 'x_post', 'x_schedule', 'x_list_scheduled', 'x_cancel_scheduled']);
+  assert.deepEqual(list.result.tools.map(tool => tool.name), ['x_status', 'x_login', 'x_preview', 'x_post', 'x_schedule', 'x_list_scheduled', 'x_cancel_scheduled', 'x_article_draft', 'x_article_publish', 'x_article_delete']);
+  assert.equal(list.result.tools.length, 10);
+  assert.match(init.result.instructions, /x_article_draft.*x_article_publish/);
+  const articleDraft = list.result.tools.find(tool => tool.name === 'x_article_draft');
+  assert.equal(articleDraft.annotations.readOnlyHint, false);
+  assert.equal(articleDraft.annotations.destructiveHint, false);
+  assert.deepEqual(articleDraft.inputSchema.required, ['markdown_path']);
+  assert.equal(list.result.tools.find(tool => tool.name === 'x_article_delete').annotations.destructiveHint, true);
+  assert.match(list.result.tools.find(tool => tool.name === 'x_article_publish').description, /explicit user confirmation.*exact article_id/);
+  for (const [name, args] of [['x_article_draft', { markdown_path: 'relative.md' }], ['x_article_draft', {}],
+    ['x_article_publish', { article_id: '123\n' }], ['x_article_delete', { article_id: 123 }]]) {
+    const invalid = await request('tools/call', { name, arguments: args });
+    assert.equal(JSON.parse(invalid.result.content[0].text).code, 'INVALID_INPUT');
+  }
   assert.match(init.result.instructions, /x_schedule/);
   const scheduleTool = list.result.tools.find(tool => tool.name === 'x_schedule');
   assert.deepEqual(scheduleTool.inputSchema.required, ['scheduled_at']);

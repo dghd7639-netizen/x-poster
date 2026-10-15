@@ -19,6 +19,10 @@ test('CLI help and invalid inputs never need Chrome', async t => {
   assert.match(help.stdout, /--at/);
   assert.match(help.stdout, /cancel/);
   assert.match(help.stdout, /--id/);
+  assert.match(help.stdout, /article-draft/);
+  assert.match(help.stdout, /article-publish/);
+  assert.match(help.stdout, /article-delete/);
+  assert.match(help.stdout, /--cover/);
   assert.match(help.stdout, /普通 Chrome/);
   assert.match(help.stdout, /Cmd\+Q/);
   assert.equal(help.stdout.includes('10 分钟'), false);
@@ -27,6 +31,14 @@ test('CLI help and invalid inputs never need Chrome', async t => {
     const result = run(args);
     assert.equal(result.status, 1);
     assert.equal(result.stdout, '');
+    assert.equal(JSON.parse(result.stderr).code, 'INVALID_INPUT');
+  }
+  for (const args of [['article-draft'], ['article-draft', '--file', './missing.md'], ['article-draft', '--file', './bad.txt'],
+    ['article-publish'], ['article-delete', '--id', '123\n'], ['article-publish', '--id', 'no'],
+    ['article-draft', '--file', './missing.md', '--text', 'ignored'], ['article-delete', '--id', '123', '--cover', './a.png'],
+    ['preview', '--file', './a.md']]) {
+    const result = run(args);
+    assert.equal(result.status, 1);
     assert.equal(JSON.parse(result.stderr).code, 'INVALID_INPUT');
   }
 });

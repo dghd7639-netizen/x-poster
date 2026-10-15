@@ -53,3 +53,12 @@ test('cancellations and unrelated history never count toward posting limits', ()
   assert.equal(check([uncertain, scheduled, ...cancellations]).postsLast24h, 2);
   assert.equal(check([uncertain, scheduled, ...cancellations]).retryAfterSec, 50);
 });
+
+test('article publications count while draft deletions never consume limits or erase publication usage', () => {
+  const published = { ts: entry(30).ts, article_id: '123', url: 'https://x.com/me/article/123' };
+  const deletions = Array.from({ length: 30 }, (_, i) => ({ ts: entry(i).ts, deleted_article: '123' }));
+  assert.deepEqual(check(deletions), check([]));
+  assert.deepEqual(check([published, ...deletions]), check([entry(30)]));
+  assert.equal(check([{ ts: entry(10).ts, article_id: '456', uncertain: true }]).retryAfterSec, 50);
+  assert.equal(check([...Array(20).fill(published), ...deletions]).allowed, false);
+});

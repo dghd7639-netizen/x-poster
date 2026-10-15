@@ -3,7 +3,7 @@ import { parseArgs } from 'node:util';
 import { resolve } from 'node:path';
 import { expandHome } from './config.mjs';
 import { XPosterError } from './errors.mjs';
-import { status, preview, post, schedule, listScheduled, cancelScheduled, openUserWindow } from './tools.mjs';
+import { status, preview, post, schedule, listScheduled, cancelScheduled, openUserWindow, articleDraft, articlePublish, articleDelete } from './tools.mjs';
 
 const usage = `x-poster 命令行（需要 Node.js 22 或更高版本）
 
@@ -18,17 +18,25 @@ const usage = `x-poster 命令行（需要 Node.js 22 或更高版本）
   schedule 创建已经由用户预览确认的 X 原生预排期
   scheduled 查看预排期帖子列表
   cancel   按 id 取消已经由用户确认的一个预排期帖子
+  article-draft   从 Markdown 新建 X 文章草稿并截图，需符合资格的 Premium 账号
+  article-publish 发布用户已经审阅并明确确认的文章草稿
+  article-delete  删除用户已经明确确认的文章草稿
 
 选项：
   --text <文字>     文字中的字面量 \\n 会转换为换行
   --image <路径>    可重复使用，最多 4 张；支持绝对路径、相对路径和 ~
   --at <ISO>       预排期时间；无偏移量时使用电脑本地时区，至少 5 分钟后
-  --id <数字>      cancel 的预排期帖 id；先列出并确认文字与时间
+  --id <数字>      cancel 的排期 id 或 article-publish / article-delete 的文章 id
+  --file <路径>    article-draft 的 .md 文件，最多 1 MB；支持相对路径
+  --title <标题>   article-draft 的可选标题，覆盖 Markdown 标题
+  --cover <路径>   article-draft 的可选本地封面，覆盖 front matter cover
   -h, --help        显示帮助
 
 先预览，再请用户确认，最后用完全相同的内容发布。
 登录可使用 Google/Apple 账号；完成后按 Cmd+Q 完全退出该 Chrome（Windows/Linux 关闭它的所有窗口）。
 请勿索要或代填密码；遇到 UNCERTAIN 不要重试，请用户检查主页或预排期列表。
+文章始终先 article-draft，展示截图、警告和 edit_url；用户确认这个 id 后才 article-publish。
+article-delete 仅删除本次创建或用户明确提供 id 并确认的草稿；文章不确定结果检查 x.com/compose/articles。
 `;
 
 function print(value) { process.stdout.write(`${JSON.stringify(value, null, 2)}\n`); }
@@ -44,6 +52,7 @@ async function main() {
       allowPositionals: true,
       options: {
         id: { type: 'string' }, at: { type: 'string' }, text: { type: 'string' }, image: { type: 'string', multiple: true },
+        file: { type: 'string' }, title: { type: 'string' }, cover: { type: 'string' },
         help: { type: 'boolean', short: 'h' },
       },
     }));
@@ -57,8 +66,14 @@ async function main() {
   if (values.at !== undefined && !['preview', 'schedule'].includes(command)) {
     throw new XPosterError('INVALID_INPUT', '--at 仅用于 preview 或 schedule。');
   }
-  if (values.id !== undefined && command !== 'cancel') {
-    throw new XPosterError('INVALID_INPUT', '--id 仅用于 cancel。');
+  if (values.id !== undefined && !['cancel', 'article-publish', 'article-delete'].includes(command)) {
+    throw new XPosterError('INVALID_INPUT', '--id 仅用于 cancel、article-publish 或 article-delete。');
+  }
+  if (['file', 'title', 'cover'].some(key => values[key] !== undefined) && command !== 'article-draft') {
+    throw new XPosterError('INVALID_INPUT', '--file、--title 和 --cover 仅用于 article-draft。');
+  }
+  if (command.startsWith('article-') && (values.text !== undefined || values.image !== undefined)) {
+    throw new XPosterError('INVALID_INPUT', '文章命令请使用 --file 或 --id，不接受 --text / --image。');
   }
   const input = {
     text: values.text?.replace(/\\n/g, '\n'),
@@ -87,6 +102,13 @@ async function main() {
     case 'cancel': print((await cancelScheduled({ id: values.id })).data); return 0;
     case 'scheduled': print((await listScheduled()).data); return 0;
     case 'post': print((await post(input)).data); return 0;
+    case 'article-draft': print((await articleDraft({
+      markdown_path: values.file === undefined ? undefined : resolve(expandHome(values.file)),
+      ...(values.title !== undefined ? { title: values.title } : {}),
+      ...(values.cover !== undefined ? { cover: resolve(expandHome(values.cover)) } : {}),
+    })).data); return 0;
+    case 'article-publish': print((await articlePublish({ article_id: values.id })).data); return 0;
+    case 'article-delete': print((await articleDelete({ article_id: values.id })).data); return 0;
     default: throw new XPosterError('INVALID_INPUT', '未知命令。', { hint: '使用 --help 查看用法。' });
   }
 }

@@ -25,8 +25,8 @@ export async function appendHistory(file, entry) {
 }
 
 export function checkRateLimit(history, { minIntervalSec, dailyLimit, now = Date.now() }) {
-  const times = history.filter(entry => !entry.cancelled_scheduled
-    && (entry.id || entry.scheduled_for || entry.uncertain === true
+  const times = history.filter(entry => !entry.cancelled_scheduled && !entry.deleted_article
+    && (entry.id || entry.article_id || entry.scheduled_for || entry.uncertain === true
       || typeof entry.text === 'string' && Number.isInteger(entry.images)))
     .map(entry => Date.parse(entry.ts)).filter(Number.isFinite).sort((a, b) => a - b);
   const last = times.at(-1);

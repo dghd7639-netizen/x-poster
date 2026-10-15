@@ -216,3 +216,15 @@ test('Page waits across navigation errors and translates navigation failure', as
   page.call = async () => false;
   assert.equal(await page.waitFor(() => true, [], { timeout: 2, interval: 1 }), null);
 });
+
+test('article Escape and DocumentEnd send trusted key events with commands only on keyDown', async () => {
+  const calls = [];
+  const page = new Page({ send: async (method, params) => calls.push([method, params]) }, 'target', 'session');
+  await page.press('Escape');
+  await page.press('DocumentEnd');
+  assert.deepEqual(calls.map(call => call[1].type), ['keyDown', 'keyUp', 'keyDown', 'keyUp']);
+  assert.equal(calls[0][1].key, 'Escape');
+  assert.equal(calls[0][1].windowsVirtualKeyCode, 27);
+  assert.deepEqual(calls[2][1].commands, ['moveToEndOfDocument']);
+  assert.equal(Object.hasOwn(calls[3][1], 'commands'), false);
+});
