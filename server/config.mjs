@@ -13,6 +13,11 @@ function numberSetting(value, fallback) {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
 }
 
+function toolWaitSetting(value) {
+  const parsed = value?.trim() ? Number(value) : NaN;
+  return Number.isFinite(parsed) ? Math.max(5, Math.min(300, parsed)) : 45;
+}
+
 const home = resolve(expandHome(process.env.X_POSTER_HOME || '~/.x-poster'));
 export const config = {
   home,
@@ -24,6 +29,8 @@ export const config = {
   headless: /^(1|true|yes|on)$/i.test(process.env.X_POSTER_HEADLESS || ''),
   minIntervalSec: numberSetting(process.env.X_POSTER_MIN_INTERVAL_SEC, 60),
   dailyLimit: numberSetting(process.env.X_POSTER_DAILY_LIMIT, 20),
+  toolWaitSec: toolWaitSetting(process.env.X_POSTER_TOOL_WAIT_SEC),
+  shutdownGraceSec: numberSetting(process.env.X_POSTER_SHUTDOWN_GRACE_SEC, 180),
 };
 
 export async function ensureHome() {

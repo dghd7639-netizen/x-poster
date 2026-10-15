@@ -18,7 +18,7 @@ test('environment defaults, disabled limits and invalid numeric fallback', async
   const url = new URL('../server/config.mjs', import.meta.url).href;
   const run = settings => {
     const env = { ...process.env, X_POSTER_HOME: home };
-    for (const key of ['X_POSTER_MIN_INTERVAL_SEC', 'X_POSTER_DAILY_LIMIT', 'X_POSTER_HEADLESS', 'X_POSTER_CHROME_PATH']) delete env[key];
+    for (const key of ['X_POSTER_MIN_INTERVAL_SEC', 'X_POSTER_DAILY_LIMIT', 'X_POSTER_HEADLESS', 'X_POSTER_CHROME_PATH', 'X_POSTER_TOOL_WAIT_SEC', 'X_POSTER_SHUTDOWN_GRACE_SEC']) delete env[key];
     const result = spawnSync(process.execPath, ['--input-type=module', '-e', `import {config} from ${JSON.stringify(url)}; console.log(JSON.stringify(config));`],
       { env: { ...env, ...settings }, encoding: 'utf8', timeout: 5000 });
     assert.equal(result.status, 0);
@@ -30,6 +30,8 @@ test('environment defaults, disabled limits and invalid numeric fallback', async
   assert.equal(defaults.dailyLimit, 20);
   assert.equal(defaults.headless, false);
   assert.equal(defaults.chromePath, null);
+  assert.equal(defaults.toolWaitSec, 45);
+  assert.equal(defaults.shutdownGraceSec, 180);
   for (const value of ['-1', 'invalid', 'Infinity', '']) {
     const config = run({ X_POSTER_MIN_INTERVAL_SEC: value, X_POSTER_DAILY_LIMIT: value });
     assert.equal(config.minIntervalSec, 60);
@@ -39,4 +41,11 @@ test('environment defaults, disabled limits and invalid numeric fallback', async
   assert.equal(disabled.minIntervalSec, 0);
   assert.equal(disabled.dailyLimit, 0);
   assert.equal(disabled.headless, true);
+  for (const [value, expected] of [['0', 5], ['-1', 5], ['5', 5], ['90', 90], ['300', 300], ['999', 300],
+    ['invalid', 45], ['Infinity', 45], ['', 45]]) {
+    assert.equal(run({ X_POSTER_TOOL_WAIT_SEC: value }).toolWaitSec, expected);
+  }
+  assert.equal(run({ X_POSTER_SHUTDOWN_GRACE_SEC: '0' }).shutdownGraceSec, 0);
+  assert.equal(run({ X_POSTER_SHUTDOWN_GRACE_SEC: '15' }).shutdownGraceSec, 15);
+  assert.equal(run({ X_POSTER_SHUTDOWN_GRACE_SEC: '-1' }).shutdownGraceSec, 180);
 });

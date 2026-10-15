@@ -1,4 +1,5 @@
 import { mkdir, readdir, stat, unlink, open } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import { join, dirname, isAbsolute, extname } from 'node:path';
 import { Browser, findChrome, openPlainWindow } from './chrome.mjs';
 import { config, ensureHome, loadState, saveState, expandHome } from './config.mjs';
@@ -14,6 +15,12 @@ export function exclusive(fn) {
   const result = queue.then(fn);
   queue = result.catch(() => {});
   return result;
+}
+
+export function pendingWork() { return queue; }
+
+export async function waitForShutdown(work = pendingWork()) {
+  await waitForOutcome(work, config.shutdownGraceSec * 1000);
 }
 
 export function openBrowser(headless) {
@@ -346,9 +353,7 @@ async function articleDraftInput(args) {
   return parseArticleMarkdown(source, { baseDir: dirname(args.markdown_path), title: args.title, cover: args.cover });
 }
 
-async function runArticle(args, mode) {
-  const input = mode === 'draft' ? await articleDraftInput(args)
-    : mode === 'cover' ? await articleCoverInput(args) : { articleId: articleIdInput(args) };
+function runArticle(input, mode, onArticleId) {
   return exclusive(async () => {
     requireUserWindowClosed();
     if (mode === 'publish') {
@@ -365,7 +370,7 @@ async function runArticle(args, mode) {
       });
       if (mode === 'draft') {
         const screenshotPath = join(config.previewsDir, `${new Date().toISOString().replace(/[:.]/g, '-')}-article.png`);
-        const { screenshot, ...result } = await createArticleDraft(browser, { ...input, screenshotPath });
+        const { screenshot, ...result } = await createArticleDraft(browser, { ...input, screenshotPath, onArticleId });
         return { data: { ok: true, ...result, screenshot: screenshotPath, warnings: input.warnings,
           next_step: '已创建新草稿，尚未发布。请向用户展示截图、标题、warnings 和 edit_url；用户也可打开 edit_url 审阅。仅在用户明确确认这一 article_id 后调用 x_article_publish。用户只要草稿时到此停止。',
         }, image: screenshot };
@@ -400,10 +405,60 @@ async function runArticle(args, mode) {
   });
 }
 
-export function articleDraft(args) { return runArticle(args, 'draft'); }
-export function articleCover(args) { return runArticle(args, 'cover'); }
-export function articlePublish(args) { return runArticle(args, 'publish'); }
-export function articleDelete(args) { return runArticle(args, 'delete'); }
+// The CLI waits for the complete draft without a tool deadline.
+export async function articleDraft(args) { return runArticle(await articleDraftInput(args), 'draft'); }
+export async function articleCover(args) { return runArticle(await articleCoverInput(args), 'cover'); }
+export async function articlePublish(args) { return runArticle({ articleId: articleIdInput(args) }, 'publish'); }
+export async function articleDelete(args) { return runArticle({ articleId: articleIdInput(args) }, 'delete'); }
+
+const articleJobs = new Map();
+const JOB_RETENTION_MS = 60 * 60 * 1000;
+const UUID_PATTERN = '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$';
+
+function pruneArticleJobs() {
+  for (const [id, job] of articleJobs) {
+    if (job.finishedAt !== undefined && Date.now() - job.finishedAt >= JOB_RETENTION_MS) articleJobs.delete(id);
+  }
+}
+
+async function articleJobResult(job) {
+  await waitForOutcome(job.done, config.toolWaitSec * 1000);
+  if (job.finishedAt !== undefined) {
+    if (job.error) throw job.error;
+    return { ...job.result, data: { ...job.result.data, job_id: job.id } };
+  }
+  return { data: {
+    ok: true, status: 'in_progress', job_id: job.id,
+    ...(job.articleId ? { article_id: job.articleId, edit_url: `https://x.com/compose/articles/edit/${job.articleId}` } : {}),
+    elapsed_sec: Math.floor((Date.now() - job.startedAt) / 1000),
+    next_step: `请使用 job_id ${job.id} 反复调用 x_article_status，直到返回最终结果。不要再次调用 x_article_draft，否则会创建重复草稿；遇到 UNCERTAIN 也不要重新创建，请检查 https://x.com/compose/articles。`,
+  } };
+}
+
+async function startArticleJob(args) {
+  const input = await articleDraftInput(args);
+  const job = { id: randomUUID(), startedAt: Date.now() };
+  articleJobs.set(job.id, job);
+  // Observe failures immediately so a timed-out client cannot cause an unhandled rejection.
+  job.done = runArticle(input, 'draft', id => { job.articleId = id; }).then(
+    result => { job.result = result; },
+    error => { job.error = error; },
+  ).finally(() => { job.finishedAt = Date.now(); });
+  return articleJobResult(job);
+}
+
+export function articleStatus(args) {
+  if (!args || typeof args !== 'object' || Array.isArray(args) || typeof args.job_id !== 'string'
+    || !new RegExp(UUID_PATTERN).test(args.job_id) || /\s/.test(args.job_id)
+    || Object.keys(args).some(key => key !== 'job_id')) {
+    throw new XPosterError('INVALID_INPUT', 'job_id 必须是草稿任务的 UUID 字符串。');
+  }
+  const job = articleJobs.get(args.job_id.toLowerCase());
+  if (!job) throw new XPosterError('INVALID_INPUT', '草稿任务不存在或已过期。', {
+    hint: '请检查 https://x.com/compose/articles，不要盲目重新创建草稿。',
+  });
+  return articleJobResult(job);
+}
 
 const articleIdSchema = {
   type: 'object', properties: { article_id: { type: 'string', pattern: '^\\d+$', description: 'Exact numeric article id from x_article_draft, or explicitly supplied by the user.' } },
@@ -476,13 +531,20 @@ export const TOOLS = [
   },
   {
     name: 'x_article_draft',
-    description: 'Create a NEW X Article draft from an absolute local Markdown file (eligible Premium account required). Never edit existing drafts. Relative local images resolve against the Markdown directory; remote images are skipped with warnings. Always create the draft first as the preview: show the screenshot, title, warnings and edit_url to the user. Only after explicit confirmation of this exact draft call x_article_publish with its article_id; stop for draft-only requests. Never retry UNCERTAIN without user review.',
+    description: 'Create a NEW X Article draft from an absolute local Markdown file (eligible Premium account required). Never edit existing drafts. Long articles return in_progress with a job_id; repeatedly call x_article_status until a final result. Never call x_article_draft again for the same file while in progress or after UNCERTAIN, because it creates duplicate drafts. Relative local images resolve against the Markdown directory; remote images are skipped with warnings. Always create the draft first as the preview: show the screenshot, title, warnings and edit_url to the user. Only after explicit confirmation of this exact draft call x_article_publish with its article_id; stop for draft-only requests.',
     inputSchema: { type: 'object', properties: {
       markdown_path: { type: 'string', description: 'Absolute local .md file path; maximum 1 MB, up to 50 body images.' },
       title: { type: 'string', description: 'Optional title override, ahead of front matter title and the first # heading.' },
       cover: { type: 'string', description: 'Optional absolute local jpg/jpeg/png/webp cover path, overrides front matter cover.' },
     }, required: ['markdown_path'], additionalProperties: false },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+  },
+  {
+    name: 'x_article_status',
+    description: 'Poll an in-process X Article draft job by job_id, without modifying the browser. Long jobs return in_progress; repeatedly poll until the final result, screenshot or error. Never call x_article_draft again for the same file while in progress or after UNCERTAIN. Finished jobs expire after one hour; unknown jobs require checking https://x.com/compose/articles before recreating.',
+    inputSchema: { type: 'object', properties: { job_id: { type: 'string', pattern: UUID_PATTERN,
+      description: 'UUID job_id returned by x_article_draft.' } }, required: ['job_id'], additionalProperties: false },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
   {
     name: 'x_article_cover',
@@ -508,10 +570,11 @@ export const TOOLS = [
 ];
 
 const handlers = { x_status: status, x_login: login, x_preview: preview, x_post: post, x_schedule: schedule, x_list_scheduled: listScheduled, x_cancel_scheduled: cancelScheduled,
-  x_article_draft: articleDraft, x_article_cover: articleCover, x_article_publish: articlePublish, x_article_delete: articleDelete };
+  x_article_draft: startArticleJob, x_article_status: articleStatus, x_article_cover: articleCover, x_article_publish: articlePublish, x_article_delete: articleDelete };
 export function hasTool(name) { return Object.hasOwn(handlers, name); }
 
 export async function callTool(name, args) {
+  pruneArticleJobs();
   try {
     if (!hasTool(name)) throw new XPosterError('INVALID_INPUT', '未知工具。');
     const { data, image } = await handlers[name](args);

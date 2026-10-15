@@ -9,7 +9,7 @@ import { createArticleDraft, setArticleCover, publishArticle, deleteArticleDraft
 import { Browser } from '../server/chrome.mjs';
 import { XPosterError } from '../server/errors.mjs';
 import { config } from '../server/config.mjs';
-import { articleDraft, articleCover, articlePublish, articleDelete, callTool } from '../server/tools.mjs';
+import { articleDraft, articleCover, articlePublish, articleDelete, callTool, pendingWork } from '../server/tools.mjs';
 import { readHistory, checkRateLimit } from '../server/limits.mjs';
 
 const test = (name, fn) => nodeTest(name, { timeout: 5000 }, fn);
@@ -17,7 +17,7 @@ const test = (name, fn) => nodeTest(name, { timeout: 5000 }, fn);
 function fixture(options = {}) {
   const state = { pathname: '/compose/articles', title: '', text: '', images: 0, cover: false, dialog: null,
     menu: false, saved: '上一次保存 初始', create: true, imagePolls: 0, rectReads: {},
-    processingText: '', cancelUpload: false, processingIndex: 0, ...options };
+    processingText: '', cancelUpload: false, processingIndex: 0, mediaOpens: 0, mediaFrames: 0, textBlocks: 0, statsReads: 0, ...options };
   const calls = [];
   const handlers = new Map();
   const bodies = new Map();
@@ -61,11 +61,20 @@ function fixture(options = {}) {
   const title = element('title'); title.placeholder = '添加标题';
   Object.defineProperty(title, 'value', { get: () => state.title });
   const composer = element('composer');
-  Object.defineProperty(composer, 'innerText', { get: () => state.text });
+  Object.defineProperty(composer, 'innerText', { get: () => state.text + (state.innerTextNoise ?? '') });
   Object.defineProperty(composer, 'textContent', { get: () => state.text });
-  composer.querySelectorAll = selector => Array(selector === 'img' || selector === S.removeMedia ? state.images : 0).fill({});
+  composer.querySelectorAll = selector => {
+    if (selector === '[data-text=true]') return state.text.split('\n').map(textContent => ({ textContent }));
+    if (selector === '[data-block=true]') {
+      return Array(state.images + state.textBlocks + (state.unstableBlocks ? ++state.statsReads : 0)).fill({});
+    }
+    return Array(selector === 'img' || selector === S.removeMedia ? state.images : 0).fill({});
+  };
   composer.dispatchEvent = event => {
-    if (!state.ignorePaste) state.text += event.clipboardData.values['text/plain'];
+    const text = event.clipboardData.values['text/plain'];
+    calls.push(['paste', text, Date.now()]);
+    if (state.dropPastes > 0) { state.dropPastes--; state.innerTextNoise = `${state.innerTextNoise ?? ''}界面变化`; }
+    else if (!state.ignorePaste) { state.text += text.slice(0, state.pasteLimit); state.textBlocks++; }
     if (!state.noSave) response('ArticleEntityUpdateContent', state.saveError ? { errors: [{ message: 'denied' }] } : { data: { ok: true } });
     if (state.indicatorSave) state.saved = `上一次保存 ${requestNumber + state.text.length}`;
   };
@@ -125,7 +134,12 @@ function fixture(options = {}) {
       if (selector === 'main, [role=main]') return reader;
       if (selector === S.dialog) return state.dialog ? dialog : null;
       if (selector === S.confirm) return state.dialog === 'delete' || state.sheetConfirm && state.dialog === 'publish' ? confirm : null;
-      if (selector === S.mediaInput) return state.dialog === 'media' ? element('mediaInput') : null;
+      if (selector === S.mediaInput) {
+        const ready = !state.mediaInputMode || state.mediaInputMode === 'frame' && state.mediaFrames > 0 && Date.now() >= state.mediaReadyAt
+          || state.mediaInputMode === 'reopen' && state.mediaOpens >= 2;
+        return state.dialog === 'media' && ready ? element('mediaInput') : null;
+      }
+      if (selector === '[role=dialog] [data-testid=app-bar-close]') return state.dialog === 'media' && state.mediaCloseButton ? element('mediaClose') : null;
       if (selector === S.insert) return element('insert');
       if (selector === S.cover) return coverButton;
       if (selector === S.profileLink) return { getAttribute: () => '/alice' };
@@ -182,7 +196,8 @@ function fixture(options = {}) {
       return null;
     },
     async click(selector) {
-      const kind = tagged.get(selector)?.kind ?? ({ [S.create]: 'create', [S.insert]: 'insert', [S.confirm]: 'confirm', [S.cover]: 'coverButton' })[selector];
+      const kind = tagged.get(selector)?.kind ?? ({ [S.create]: 'create', [S.insert]: 'insert', [S.confirm]: 'confirm', [S.cover]: 'coverButton',
+        '[role=dialog] [data-testid=app-bar-close]': 'mediaClose' })[selector];
       calls.push(['click', kind ?? selector]);
       if (state.coveredClicks?.[kind] > 0) {
         state.coveredClicks[kind]--;
@@ -196,7 +211,8 @@ function fixture(options = {}) {
       }
       if (kind === 'create') { state.pathname = '/compose/articles/edit/123'; state.title = ''; lookupArticle(); }
       if (kind === 'insert' || kind === 'more') state.menu = true;
-      if (kind === 'media') { state.menu = false; state.dialog = 'media'; }
+      if (kind === 'media') { state.menu = false; state.dialog = 'media'; state.mediaOpens++; }
+      if (kind === 'mediaClose') { state.dialog = null; if (state.imagesOnClose) state.images += state.imagesOnClose; }
       if (kind === 'coverButton' && !state.noChooser) {
         const opened = () => emit('Page.fileChooserOpened', { backendNodeId: 42 });
         if (state.chooserDelay) setTimeout(opened, state.chooserDelay);
@@ -233,7 +249,16 @@ function fixture(options = {}) {
       if (state.clickError && ['publish', 'confirm'].includes(kind)) throw new Error('transport closed');
       calls.push(['clicked', kind, Date.now()]);
     },
-    async press(key) { calls.push(['press', key]); if (key === 'Escape') state.menu = false; },
+    async press(key) {
+      calls.push(['press', key]);
+      if (key === 'Escape') {
+        state.menu = false;
+        if (state.dialog === 'media' && !state.mediaCloseStuck) {
+          state.dialog = null;
+          if (state.imagesOnClose) state.images += state.imagesOnClose;
+        }
+      }
+    },
     async insertText(value) { state.title += value; response('ArticleEntityUpdateTitle'); },
     async setFiles(selector, paths) {
       calls.push(['files', selector, paths]);
@@ -249,6 +274,12 @@ function fixture(options = {}) {
     on(method, handler) { if (!handlers.has(method)) handlers.set(method, new Set()); handlers.get(method).add(handler); return () => handlers.get(method).delete(handler); },
     async screenshot() {
       calls.push(['screenshot', Date.now()]);
+      if (state.dialog === 'media') {
+        state.mediaFrames++;
+        state.mediaReadyAt = Date.now() + 250;
+        if (state.imagesOnFrame) state.images += state.imagesOnFrame;
+        if (state.mediaScreenshotError) throw new Error('frame capture failed');
+      }
       if (state.screenshotError) throw new Error('screenshot failed');
       return Buffer.from('mock PNG');
     },
@@ -292,8 +323,11 @@ async function input(t, extra = {}) {
 test('draft creates a new id, pastes rich HTML, awaits save and returns a screenshot', async t => {
   const f = fixture();
   const args = await input(t);
+  const ids = [];
+  args.onArticleId = id => { ids.push(id); assert.equal(f.state.text, ''); };
   const result = await runClock(t, () => createArticleDraft(f.browser, args));
   assert.equal(result.article_id, '123');
+  assert.deepEqual(ids, ['123']);
   assert.equal(result.edit_url, 'https://x.com/compose/articles/edit/123');
   assert.equal(result.title, args.title);
   assert.deepEqual(result.screenshot, await readFile(args.screenshotPath));
@@ -315,6 +349,271 @@ test('image insertion waits for media count and cover crop clicks Apply', async 
   assert.equal(result.cover, true);
   assert.equal(f.state.imagePolls, 1);
   assert.ok(f.calls.some(call => call[1] === 'apply'));
+});
+
+test('strict paste retries one dropped event and reports non-whitespace text counts', async t => {
+  const f = fixture({ dropPastes: 1 });
+  const args = await input(t, { segments: [{ type: 'html', html: '<p>正文 hello</p><p>世界</p>', text: '正文 hello\n世界\t ' }] });
+  const result = await runClock(t, () => createArticleDraft(f.browser, args));
+  assert.equal(f.calls.filter(call => call[0] === 'paste').length, 2);
+  assert.equal(result.text_chars_inserted, 9);
+  assert.equal(result.text_chars_expected, 9);
+  assert.equal(f.state.text, args.segments[0].text);
+});
+
+test('strict paste rejects two dropped events even when innerText changes', async t => {
+  const f = fixture({ dropPastes: 2 });
+  const args = await input(t);
+  await assert.rejects(runClock(t, () => createArticleDraft(f.browser, args)), error => {
+    assert.equal(error.code, 'UNCERTAIN');
+    assert.equal(error.message, '文章正文粘贴不完整，草稿可能缺少内容。');
+    assert.equal(error.details.article_id, '123');
+    return true;
+  });
+  assert.equal(f.calls.filter(call => call[0] === 'paste').length, 2);
+  assert.equal(f.state.closed, true);
+  assert.equal(f.listenerCount(), 0);
+});
+
+test('strict paste rejects a partial gain below 60 percent without retrying', async t => {
+  const f = fixture({ pasteLimit: 2 });
+  const args = await input(t, { segments: [{ type: 'html', html: '<p>abcdefghij</p>', text: 'abcdefghij' }] });
+  await assert.rejects(runClock(t, () => createArticleDraft(f.browser, args)), error => {
+    assert.equal(error.code, 'UNCERTAIN');
+    assert.equal(error.message, '文章正文粘贴不完整，草稿可能缺少内容。');
+    return true;
+  });
+  assert.equal(f.calls.filter(call => call[0] === 'paste').length, 1);
+  assert.equal(f.state.text, 'ab');
+});
+
+test('text paste after images waits at least one second and two stable stats polls', async t => {
+  const f = fixture();
+  let finishedAt;
+  const originalWait = f.page.waitFor;
+  t.mock.method(f.page, 'waitFor', async function (fn, ...args) {
+    const result = await originalWait.call(this, fn, ...args);
+    if (fn.toString().includes('Processing media') && result) finishedAt = Date.now();
+    return result;
+  });
+  const args = await input(t, { segments: [
+    { type: 'images', paths: ['/tmp/one.png'] },
+    { type: 'html', html: '<p>After image</p>', text: 'After image' },
+  ] });
+  const result = await runClock(t, () => createArticleDraft(f.browser, args));
+  const pastedAt = f.calls.find(call => call[0] === 'paste')[2];
+  assert.ok(finishedAt !== undefined);
+  assert.ok(pastedAt - finishedAt >= 1250, `paste ran ${pastedAt - finishedAt} ms after images finished`);
+  assert.equal(result.images_inserted, 1);
+  assert.equal(result.text_chars_inserted, 10);
+  assert.equal(result.text_chars_expected, 10);
+});
+
+test('editor that never settles after images fails within five simulated seconds', async t => {
+  const f = fixture({ unstableBlocks: true });
+  let finishedAt;
+  const originalWait = f.page.waitFor;
+  t.mock.method(f.page, 'waitFor', async function (fn, ...args) {
+    const result = await originalWait.call(this, fn, ...args);
+    if (fn.toString().includes('Processing media') && result) finishedAt = Date.now();
+    return result;
+  });
+  const args = await input(t, { segments: [
+    { type: 'images', paths: ['/tmp/one.png'] }, { type: 'html', html: '<p>Later</p>', text: 'Later' },
+  ] });
+  await runClock(t, async () => {
+    await assert.rejects(createArticleDraft(f.browser, args), error => error.code === 'UNCERTAIN');
+    assert.ok(Date.now() - finishedAt <= 5000);
+  });
+  assert.equal(f.calls.filter(call => call[0] === 'paste').length, 0);
+});
+
+test('final text total below 90 percent fails despite passing each paste threshold', async t => {
+  const f = fixture({ pasteLimit: 8 });
+  const args = await input(t, { segments: [{ type: 'html', html: '<p>abcdefghij</p>', text: 'abcdefghij' }] });
+  await assert.rejects(runClock(t, () => createArticleDraft(f.browser, args)), error => {
+    assert.equal(error.code, 'UNCERTAIN');
+    assert.equal(error.message, '文章正文字数与 Markdown 不一致，请检查草稿。');
+    return true;
+  });
+  assert.equal(f.calls.filter(call => call[0] === 'paste').length, 1);
+});
+
+test('happy path reports text counts from text nodes, excluding whitespace and composer UI text', async t => {
+  const f = fixture({ innerTextNoise: '不可计入正文的界面文字' });
+  const args = await input(t, { segments: [
+    { type: 'html', html: '<p>A B</p>', text: 'A B\n' },
+    { type: 'html', html: '<p>正文</p>', text: ' 正\t文 ' },
+  ] });
+  const result = await runClock(t, () => createArticleDraft(f.browser, args));
+  assert.equal(result.text_chars_inserted, 4);
+  assert.equal(result.text_chars_expected, 4);
+  assert.equal(f.calls.filter(call => call[0] === 'paste').length, 2);
+});
+
+test('late original paste during retry delay is never duplicated, even when only partial', async t => {
+  const args = await input(t, { segments: [{ type: 'html', html: '<p>abcdefghij</p>', text: 'abcdefghij' }] });
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: Date.now() });
+  for (const text of ['abcdefghij', 'ab']) {
+    const f = fixture({ dropPastes: 1 });
+    const originalCall = f.page.call;
+    t.mock.method(f.page, 'call', async function (fn, ...values) {
+      const result = await originalCall.call(this, fn, ...values);
+      if (fn.toString().includes('ClipboardEvent')) setTimeout(() => {
+        f.state.text += text;
+        f.state.textBlocks++;
+        f.response('ArticleEntityUpdateContent');
+      }, 5500);
+      return result;
+    });
+    if (text.length === 10) {
+      const result = await jobClock(t, createArticleDraft(f.browser, args));
+      assert.equal(result.text_chars_inserted, 10);
+    } else {
+      await assert.rejects(jobClock(t, createArticleDraft(f.browser, args)), error => error.code === 'UNCERTAIN'
+        && error.message === '文章正文粘贴不完整，草稿可能缺少内容。');
+    }
+    assert.equal(f.calls.filter(call => call[0] === 'paste').length, 1);
+    assert.equal(f.state.text, text);
+  }
+});
+
+test('editor settle compares both block and character counts before continuing', async t => {
+  const f = fixture();
+  const readings = [{ blocks: 1, textChars: 0 }, { blocks: 2, textChars: 0 },
+    { blocks: 2, textChars: 1 }, { blocks: 2, textChars: 1 }];
+  const originalCall = f.page.call;
+  let finishedAt;
+  const originalWait = f.page.waitFor;
+  t.mock.method(f.page, 'waitFor', async function (fn, ...args) {
+    const result = await originalWait.call(this, fn, ...args);
+    if (fn.toString().includes('Processing media') && result) finishedAt = Date.now();
+    return result;
+  });
+  t.mock.method(f.page, 'call', async function (fn, ...args) {
+    if (fn.toString().includes('[data-block=true]') && readings.length) return readings.shift();
+    return originalCall.call(this, fn, ...args);
+  });
+  const args = await input(t, { segments: [
+    { type: 'images', paths: ['/tmp/one.png'] }, { type: 'html', html: '<p>正文</p>', text: '正文' },
+  ] });
+  await runClock(t, () => createArticleDraft(f.browser, args));
+  assert.equal(readings.length, 0);
+  assert.equal(f.calls.find(call => call[0] === 'paste')[2] - finishedAt, 1750);
+});
+
+test('text thresholds accept exactly 90 percent overall and floor the per-paste minimum', async t => {
+  for (const [text, pasteLimit, succeeds] of [['abcdefghij', 9, true], ['abcdefg', 4, false]]) {
+    const f = fixture({ pasteLimit });
+    const args = await input(t, { segments: [{ type: 'html', html: `<p>${text}</p>`, text }] });
+    if (succeeds) {
+      const result = await runClock(t, () => createArticleDraft(f.browser, args));
+      assert.equal(result.text_chars_inserted, 9);
+      assert.equal(result.text_chars_expected, 10);
+    } else {
+      await assert.rejects(runClock(t, () => createArticleDraft(f.browser, args)), error => error.code === 'UNCERTAIN'
+        && error.message === '文章正文字数与 Markdown 不一致，请检查草稿。');
+    }
+    assert.equal(f.calls.filter(call => call[0] === 'paste').length, 1);
+  }
+});
+
+test('media input absent until a screenshot opens on the first attempt and sets the group once', async t => {
+  const f = fixture({ mediaInputMode: 'frame', pollWaits: true });
+  const paths = ['/tmp/one.png', '/tmp/two.png'];
+  const args = await input(t, { segments: [{ type: 'images', paths }] });
+  const result = await runClock(t, () => createArticleDraft(f.browser, args));
+  assert.equal(result.images_inserted, 2);
+  assert.equal(f.state.mediaOpens, 1);
+  assert.equal(f.state.mediaFrames, 1);
+  const files = f.calls.filter(call => call[0] === 'files' && call[1] === S.mediaInput);
+  assert.equal(files.length, 1);
+  assert.deepEqual(files[0][2], paths);
+  assert.equal(f.calls.filter(call => call[0] === 'screenshot').length, 2, 'one discarded frame plus the final preview');
+});
+
+test('media input absent until reopen retries Insert and Media, including failed frame captures', async t => {
+  for (const options of [{}, { mediaCloseButton: true }, { mediaScreenshotError: true }]) {
+    const f = fixture({ mediaInputMode: 'reopen', pollWaits: true, ...options });
+    const args = await input(t, { segments: [{ type: 'images', paths: ['/tmp/one.png'] }] });
+    const result = await runClock(t, () => createArticleDraft(f.browser, args));
+    assert.equal(result.images_inserted, 1);
+    for (const kind of ['insert', 'media']) assert.equal(f.calls.filter(call => call[0] === 'clicked' && call[1] === kind).length, 2);
+    assert.equal(f.calls.filter(call => call[0] === 'files' && call[1] === S.mediaInput).length, 1);
+    assert.equal(f.state.mediaFrames, 1);
+    if (options.mediaCloseButton) assert.equal(f.calls.filter(call => call[0] === 'clicked' && call[1] === 'mediaClose').length, 1);
+  }
+});
+
+test('media input never appears: three attempts fail within 30 simulated seconds without setting files', async t => {
+  const f = fixture({ mediaInputMode: 'never', pollWaits: true });
+  const args = await input(t, { segments: [{ type: 'images', paths: ['/tmp/one.png'] }] });
+  await runClock(t, async () => {
+    const started = Date.now();
+    await assert.rejects(createArticleDraft(f.browser, args), error => {
+      assert.equal(error.code, 'UI_CHANGED');
+      assert.equal(error.message, '文章媒体上传窗口未打开。');
+      assert.equal(error.details.attempts, 3);
+      assert.equal(error.details.article_id, '123');
+      assert.ok(error.details.edit_url.endsWith('/123'));
+      return true;
+    });
+    const elapsed = Date.now() - started;
+    assert.ok(elapsed >= 15000 && elapsed < 30000, `media retries took ${elapsed} ms`);
+    t.diagnostic(`media dialog exhausted in ${elapsed} ms simulated`);
+  });
+  assert.equal(f.state.mediaOpens, 3);
+  assert.equal(f.state.mediaFrames, 3);
+  assert.equal(f.calls.filter(call => call[0] === 'files').length, 0);
+  assert.equal(f.state.closed, true);
+  assert.equal(f.listenerCount(), 0);
+});
+
+test('media retry stops as UNCERTAIN when image count increases before or during dialog close', async t => {
+  for (const options of [{ imagesOnFrame: 1 }, { imagesOnClose: 1 }]) {
+    const f = fixture({ mediaInputMode: 'reopen', pollWaits: true, ...options });
+    const args = await input(t, { segments: [{ type: 'images', paths: ['/tmp/one.png'] }] });
+    await assert.rejects(runClock(t, () => createArticleDraft(f.browser, args)), error => {
+      assert.equal(error.code, 'UNCERTAIN');
+      assert.equal(error.details.article_id, '123');
+      assert.ok(error.details.edit_url.endsWith('/123'));
+      assert.match(error.hint, /不要.*重试/);
+      return true;
+    });
+    assert.equal(f.state.mediaOpens, 1);
+    assert.equal(f.calls.filter(call => call[0] === 'files').length, 0);
+    assert.equal(f.listenerCount(), 0);
+  }
+});
+
+test('media retries never reopen a dialog that Escape failed to close', async t => {
+  const f = fixture({ mediaInputMode: 'never', pollWaits: true, mediaCloseStuck: true });
+  const args = await input(t, { segments: [{ type: 'images', paths: ['/tmp/one.png'] }] });
+  await assert.rejects(runClock(t, () => createArticleDraft(f.browser, args)), error => error.code === 'UI_CHANGED');
+  assert.equal(f.state.mediaOpens, 1);
+  assert.equal(f.calls.filter(call => call[0] === 'files').length, 0);
+});
+
+test('second image group recovers its stalled dialog without resending any of seven images', async t => {
+  const f = fixture({ pollWaits: true });
+  const segments = Array.from({ length: 7 }, (_, i) => ({ type: 'images', paths: [`/tmp/image-${i + 1}.png`] }));
+  const originalClick = f.page.click;
+  t.mock.method(f.page, 'click', async selector => {
+    if (selector === S.insert && f.state.images === 1) f.state.mediaInputMode = 'reopen';
+    await originalClick(selector);
+  });
+  const originalCall = f.page.call;
+  t.mock.method(f.page, 'call', async function (fn, ...args) {
+    if (args[0] === S.mediaInput && f.state.mediaOpens === 2) return null;
+    return originalCall.call(this, fn, ...args);
+  });
+  const args = await input(t, { segments });
+  const result = await runClock(t, () => createArticleDraft(f.browser, args));
+  assert.equal(result.images_inserted, 7);
+  assert.equal(f.state.mediaOpens, 8);
+  const groups = f.calls.filter(call => call[0] === 'files' && call[1] === S.mediaInput);
+  assert.deepEqual(groups.map(call => call[2]), segments.map(segment => segment.paths));
+  assert.equal(f.state.mediaFrames, 1);
 });
 
 test('save requires final content response; earlier title save and failed GraphQL updates do not count', async t => {
@@ -417,7 +716,8 @@ test('article argument, file, cover and image validation all precede browser wor
 test('draft MCP returns image, warnings and review instructions with no publication history', async t => {
   const f = await toolFixture(t);
   await writeFile(f.markdown_path, '# T\n正文\n---');
-  const result = await runClock(t, () => callTool('x_article_draft', { markdown_path: f.markdown_path, title: 'Override' }));
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: Date.now() });
+  const result = await jobClock(t, callTool('x_article_draft', { markdown_path: f.markdown_path, title: 'Override' }));
   assert.equal(result.isError, undefined);
   const data = JSON.parse(result.content[0].text);
   assert.equal(data.title, 'Override');
@@ -845,9 +1145,10 @@ test('MCP preserves cover-image timeout warnings for cover updates and draft cre
   const f = await toolFixture(t, { coverComplete: false });
   const cover = join(f.dir, 'cover.png');
   await writeFile(cover, 'image');
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: Date.now() });
   for (const [tool, args] of [['x_article_cover', { article_id: '123', cover }],
     ['x_article_draft', { markdown_path: f.markdown_path, cover }]]) {
-    const result = await runClock(t, () => callTool(tool, args));
+    const result = await jobClock(t, callTool(tool, args));
     assert.equal(result.isError, undefined);
     const data = JSON.parse(result.content[0].text);
     assert.equal(data.ok, true);
@@ -1176,4 +1477,188 @@ test('login, challenge and published detection retain priority over missing arti
     });
     assert.equal(f.listenerCount(), 0);
   }
+});
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+  return { promise, resolve, reject };
+}
+
+async function jobClock(t, promise) {
+  let outcome;
+  promise.then(value => { outcome = { value }; }, error => { outcome = { error }; });
+  const deadline = performance.now() + 2000;
+  while (!outcome) {
+    await new Promise(resolve => setImmediate(resolve));
+    assert.ok(performance.now() < deadline, 'job did not settle within 2 seconds');
+    if (!outcome) t.mock.timers.tick(250);
+  }
+  if (outcome.error) throw outcome.error;
+  return outcome.value;
+}
+
+async function pausedDraft(t, { beforeId = false } = {}) {
+  const f = await toolFixture(t);
+  config.toolWaitSec = 45;
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: Date.now() });
+  const entered = deferred();
+  const gate = deferred();
+  const original = f.page.insertText;
+  if (beforeId) {
+    t.mock.method(Browser, 'open', async () => {
+      entered.resolve();
+      await gate.promise;
+      return { isLoggedIn: async () => true, newPage: async () => f.page, close: async () => {} };
+    });
+  } else {
+    t.mock.method(f.page, 'insertText', async (...args) => {
+      entered.resolve();
+      await gate.promise;
+      return original(...args);
+    });
+  }
+  const draft = callTool('x_article_draft', { markdown_path: f.markdown_path });
+  await entered.promise;
+  t.mock.timers.tick(45000);
+  const progress = await draft;
+  const data = JSON.parse(progress.content[0].text);
+  t.after(async () => { gate.resolve(); await jobClock(t, pendingWork()); });
+  return { ...f, gate, progress, data };
+}
+
+test('fast MCP draft returns its final shape, UUID and image, with idempotent status', async t => {
+  const f = await toolFixture(t);
+  config.toolWaitSec = 45;
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: Date.now() });
+  const result = await jobClock(t, callTool('x_article_draft', { markdown_path: f.markdown_path }));
+  const data = JSON.parse(result.content[0].text);
+  assert.equal(data.ok, true);
+  assert.equal(data.status, undefined);
+  assert.match(data.job_id, /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/);
+  assert.equal(data.article_id, '123');
+  assert.equal(data.title, 'Title');
+  assert.equal(data.text_chars_inserted, 2);
+  assert.equal(data.text_chars_expected, 2);
+  assert.deepEqual(data.warnings, []);
+  assert.equal(result.content[1].type, 'image');
+  assert.equal(result.content[1].data, Buffer.from('mock PNG').toString('base64'));
+  assert.deepEqual(await callTool('x_article_status', { job_id: data.job_id }), result);
+  assert.deepEqual(await callTool('x_article_status', { job_id: data.job_id.toUpperCase() }), result);
+  assert.equal(f.opened.mock.callCount(), 1);
+});
+
+test('slow draft exposes its id, repeated status waits, and later returns the final image', async t => {
+  const f = await pausedDraft(t);
+  assert.equal(f.progress.isError, undefined);
+  assert.equal(f.data.ok, true);
+  assert.equal(f.data.status, 'in_progress');
+  assert.equal(f.data.article_id, '123');
+  assert.equal(f.data.edit_url, 'https://x.com/compose/articles/edit/123');
+  assert.equal(f.data.elapsed_sec, 45);
+  assert.match(f.data.next_step, /job_id.*x_article_status.*不要再次调用 x_article_draft.*重复草稿/);
+  assert.equal(f.progress.content.length, 1);
+  const poll = callTool('x_article_status', { job_id: f.data.job_id });
+  t.mock.timers.tick(45000);
+  assert.equal(JSON.parse((await poll).content[0].text).status, 'in_progress');
+  assert.equal(f.state.browserClosed, undefined);
+  f.gate.resolve();
+  const result = await jobClock(t, callTool('x_article_status', { job_id: f.data.job_id }));
+  const data = JSON.parse(result.content[0].text);
+  assert.equal(data.status, undefined);
+  assert.equal(data.job_id, f.data.job_id);
+  assert.equal(data.images_inserted, 0);
+  assert.equal(result.content[1].type, 'image');
+  assert.equal(f.state.browserClosed, true);
+  assert.equal(f.opened.mock.callCount(), 1);
+});
+
+test('draft can time out before its id is known and status preserves a late XPosterError exactly', async t => {
+  const f = await pausedDraft(t, { beforeId: true });
+  assert.equal(f.data.status, 'in_progress');
+  assert.equal(f.data.article_id, undefined);
+  assert.equal(f.data.edit_url, undefined);
+  const failure = new XPosterError('UNCERTAIN', '无法确认草稿。', {
+    hint: '不要重试。', article_id: '123', edit_url: 'https://x.com/compose/articles/edit/123',
+  });
+  f.gate.reject(failure);
+  const result = await callTool('x_article_status', { job_id: f.data.job_id });
+  assert.equal(result.isError, true);
+  assert.deepEqual(JSON.parse(result.content[0].text), { ok: false, ...failure.toJSON() });
+  assert.deepEqual(await callTool('x_article_status', { job_id: f.data.job_id }), result);
+});
+
+test('unknown UUID and invalid status inputs fail without browser work', async t => {
+  const f = await toolFixture(t);
+  for (const args of [undefined, null, [], {}, { job_id: 123 }, { job_id: '123' },
+    { job_id: '00000000-0000-0000-0000-000000000000\n' },
+    { job_id: '00000000-0000-0000-0000-000000000000', extra: true }]) {
+    const result = await callTool('x_article_status', args);
+    assert.equal(result.isError, true);
+    assert.equal(JSON.parse(result.content[0].text).code, 'INVALID_INPUT');
+  }
+  const unknown = await callTool('x_article_status', { job_id: '00000000-0000-0000-0000-000000000000' });
+  assert.equal(JSON.parse(unknown.content[0].text).code, 'INVALID_INPUT');
+  assert.match(JSON.parse(unknown.content[0].text).hint, /https:\/\/x.com\/compose\/articles.*不要盲目/);
+  assert.equal(f.opened.mock.callCount(), 0);
+});
+
+test('finished jobs expire one hour after completion, pending jobs are retained', async t => {
+  const f = await pausedDraft(t, { beforeId: true });
+  t.mock.timers.tick(3600000);
+  const running = callTool('x_article_status', { job_id: f.data.job_id });
+  t.mock.timers.tick(45000);
+  assert.equal(JSON.parse((await running).content[0].text).status, 'in_progress');
+  f.gate.resolve();
+  const done = await jobClock(t, callTool('x_article_status', { job_id: f.data.job_id }));
+  assert.equal(done.isError, undefined);
+  t.mock.timers.tick(3599999);
+  assert.deepEqual(await callTool('x_article_status', { job_id: f.data.job_id }), done);
+  t.mock.timers.tick(1);
+  const expired = await callTool('x_article_status', { job_id: f.data.job_id });
+  assert.equal(expired.isError, true);
+  assert.equal(JSON.parse(expired.content[0].text).code, 'INVALID_INPUT');
+  assert.match(JSON.parse(expired.content[0].text).hint, /不要盲目/);
+});
+
+test('MCP draft validation returns immediately without starting browser work or a job timer', async t => {
+  const f = await toolFixture(t);
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: Date.now() });
+  for (const args of [{}, { markdown_path: 'relative.md' }, { markdown_path: f.markdown_path, title: '' },
+    { markdown_path: join(f.dir, 'missing.md') }, { markdown_path: f.markdown_path, extra: true }]) {
+    const result = await callTool('x_article_draft', args);
+    assert.equal(result.isError, true);
+    const data = JSON.parse(result.content[0].text);
+    assert.equal(data.code, 'INVALID_INPUT');
+    assert.equal(data.job_id, undefined);
+  }
+  assert.equal(f.opened.mock.callCount(), 0);
+  await pendingWork();
+});
+
+test('CLI draft entry waits past the MCP deadline and returns only the final result', async t => {
+  const f = await toolFixture(t);
+  config.toolWaitSec = 5;
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: Date.now() });
+  const gate = deferred();
+  const entered = deferred();
+  const original = f.page.insertText;
+  t.mock.method(f.page, 'insertText', async (...args) => {
+    entered.resolve();
+    await gate.promise;
+    return original(...args);
+  });
+  let returned = false;
+  const draft = articleDraft({ markdown_path: f.markdown_path }).then(result => { returned = true; return result; });
+  await entered.promise;
+  t.mock.timers.tick(60000);
+  await Promise.resolve();
+  assert.equal(returned, false);
+  gate.resolve();
+  const result = await jobClock(t, draft);
+  assert.equal(result.data.article_id, '123');
+  assert.equal(result.data.status, undefined);
+  assert.equal(result.data.job_id, undefined);
+  assert.ok(Buffer.isBuffer(result.image));
 });

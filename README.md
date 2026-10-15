@@ -2,7 +2,7 @@
 
 让 Claude Code 和 Codex 通过本机 Chrome 在 X（Twitter）发布文字和最多 4 张本地图片。默认流程为**预览 → 用户明确确认 → 发布 → 返回链接**，用户提供的文字保持原样。支持使用 **X 自带的预排期** 定时发帖，由 X 服务器到时发布，电脑可以关机。
 
-插件运行一个零依赖的 Node.js ≥ 22 MCP stdio 服务器，名称为 `x-poster`，启动命令为 `node server/index.mjs`。服务器通过 Chrome DevTools Protocol（CDP）操作专用浏览器 profile，提供推文、预排期和 Markdown 长文章的十一个工具（见工具参考）。仓库根目录同时是两种宿主的插件根目录和市场根目录；两种宿主共用 `skills/x-poster/SKILL.md` 和默认数据目录 `~/.x-poster`，登录一次即可共用会话。
+插件运行一个零依赖的 Node.js ≥ 22 MCP stdio 服务器，名称为 `x-poster`，启动命令为 `node server/index.mjs`。服务器通过 Chrome DevTools Protocol（CDP）操作专用浏览器 profile，提供推文、预排期和 Markdown 长文章的十二个工具（见工具参考）。仓库根目录同时是两种宿主的插件根目录和市场根目录；两种宿主共用 `skills/x-poster/SKILL.md` 和默认数据目录 `~/.x-poster`，登录一次即可共用会话。
 
 ## ⚠️ 风险
 
@@ -120,6 +120,8 @@ agent 先调用 `x_status`，必要时引导用户登录；准备文字和本地
 
 ## 工具参考
 
+共 12 个 MCP 工具。
+
 | 工具 | 参数 | 行为与结果 |
 |---|---|---|
 | `x_status` | 无 | 返回 `logged_in`、`username`、`login_window_open`、`posts_last_24h`、`last_post_at`、`next_post_allowed_in_sec`、`limits`、`headless`、`data_dir`。 |
@@ -129,16 +131,23 @@ agent 先调用 `x_status`，必要时引导用户登录；准备文字和本地
 | `x_schedule` | `text?`、`images?`、`scheduled_at`（必填） | 创建 X 原生预排期，返回 `scheduled: true`、`id`、`scheduled_at`、`scheduled_at_local`、`manage_url`。 |
 | `x_list_scheduled` | 无 | 返回按时间排序的 `scheduled` 和 `count`；每项含 `id`、`scheduled_at`、`text`、`media_count`、`state`（未知时为 `null`）。 |
 | `x_cancel_scheduled` | `id`（纯数字字符串） | 取消一个用户已明确确认的预排期帖；成功返回 `deleted: true`、`id` 和剩余数量 `remaining`，取消不计入发布额度。 |
-| `x_article_draft` | `markdown_path`（绝对路径）、`title?`、`cover?`（绝对路径） | 从 Markdown 新建文章草稿，返回 `article_id`、`edit_url`、标题、图片实际／预期数量、封面状态、字数文字、截图路径与图像、`warnings` 和 `next_step`；不会修改已有草稿。 |
+| `x_article_draft` | `markdown_path`（绝对路径）、`title?`、`cover?`（绝对路径） | 从 Markdown 新建文章草稿；长任务返回 `in_progress` 和 `job_id`，完成后返回 `job_id`、`article_id`、`edit_url`、标题、图片实际／预期数量、封面状态、字数文字、截图路径与图像、`warnings` 和 `next_step`；不会修改已有草稿。 |
+| `x_article_status` | `job_id`（UUID） | 只读、幂等查询草稿任务；返回最终结果及图像、原始错误或 `in_progress`，无需审批。 |
 | `x_article_cover` | `article_id`（纯数字字符串）、`cover`（绝对路径，支持 `~`） | 为用户指定的已有草稿添加或替换封面，返回 `article_id`、`edit_url`、`replaced`、`cover: true`、截图路径与图像；不发布、不修改正文、不写历史、不占发布额度。 |
 | `x_article_publish` | `article_id`（纯数字字符串） | 发布用户明确确认的这份草稿，返回 `article_id`，能确定链接时返回 `url`；计入发布限制。 |
 | `x_article_delete` | `article_id`（纯数字字符串） | 删除用户明确确认的草稿，核验删除响应和列表后返回 `deleted: true`；不计入发布限制。 |
 
 `text` 为字符串，`images` 为本地路径数组。预览截图默认位于 `~/.x-poster/previews/`；预览不计入真实发布额度。
 
+草稿最终结果包含 `text_chars_inserted` 和 `text_chars_expected`，分别表示正文 `[data-text=true]` 元素的实际非空白字数与 Markdown 纯文本预期非空白字数；实际总数低于预期的 90% 时返回 `UNCERTAIN`。
+
 ## 文章
 
 X Articles 是 `https://x.com/compose/articles` 的长文章编辑器，需要**具备文章权限的 X Premium 账号**；没有新建入口时返回 `ARTICLES_UNAVAILABLE`。新文章采用 **新建草稿 → 用户审阅截图或 `edit_url` → 明确确认该 `article_id` → 发布**。草稿就是预览，不会公开；只要草稿时到此停止。不要把草稿截图当作发布成功。
+
+多图长文章可能超过客户端约 60 秒的超时。`x_article_draft` 默认等待 45 秒；未完成时返回 `ok: true`、`status: "in_progress"`、`job_id`、`elapsed_sec`、`next_step`，已知草稿 id 时还返回 `article_id` 和 `edit_url`。此时反复调用 `x_article_status({ job_id })`，直到得到最终结果及图像或错误。**任务进行中或收到 `UNCERTAIN` 后，绝不要为同一个文件再次调用 `x_article_draft`，否则会创建重复草稿。**
+
+任务存储在当前服务器进程内，完成后保留 1 小时，后续工具调用时清理。任务未知或过期时先检查 https://x.com/compose/articles，不要盲目重建。客户端取消请求不会取消草稿工作；stdin 关闭或收到 SIGTERM / SIGINT 时，服务器默认等待正在执行或排队的工作最多 180 秒；第二次 SIGINT 立即退出。退出宽限到期或进程重启后不能继续轮询旧任务，需到 X 核对草稿。CLI 的 `article-draft` 始终等待最终结果，不输出 `in_progress`。
 
 提供本地 `.md` 文件，最多 1 MB，正文不能为空，正文图片最多 50 张。标题优先级是工具／CLI 参数 `title` → front matter `title:` → 首个 `# ` 标题；首个 `# ` 标题会从正文移除。可选 front matter 使用简单的 `key: value`（支持成对引号），不支持完整 YAML：
 
@@ -198,6 +207,8 @@ node server/cli.mjs article-cover --id '123' --cover ./cover.png
 | `X_POSTER_HEADLESS` | `0` | 设为 `1` 后发布使用无窗口模式；登录始终显示窗口。 |
 | `X_POSTER_MIN_INTERVAL_SEC` | `60` | 两次发布之间的最小秒数；`0` 关闭此限制。 |
 | `X_POSTER_DAILY_LIMIT` | `20` | 滚动 24 小时的最大发布数量；`0` 关闭此限制。 |
+| `X_POSTER_TOOL_WAIT_SEC` | `45` | MCP 草稿创建／状态查询单次等待秒数，限制在 5–300；无效值回退默认。应小于客户端工具超时。CLI 始终等待完成。 |
+| `X_POSTER_SHUTDOWN_GRACE_SEC` | `180` | stdin 关闭或 SIGTERM / SIGINT 后等待工作完成的最长秒数；`0` 立即退出。 |
 
 Claude Code 可通过启动 shell 设置变量，或合并到 `~/.claude/settings.json` 的 `env` 块：
 
@@ -211,7 +222,7 @@ Claude Code 可通过启动 shell 设置变量，或合并到 `~/.claude/setting
 }
 ```
 
-Codex 在启动它的 shell 中设置变量；插件已通过 `env_vars` 放行上表的 5 个变量。例如：
+Codex 在启动它的 shell 中设置变量；当前插件的 `env_vars` 放行原有 5 个变量（HOME、CHROME_PATH、HEADLESS、MIN_INTERVAL_SEC、DAILY_LIMIT）。新增等待／退出变量需由宿主传入 MCP 进程；本次未修改 `.codex-mcp.json`。直接启动服务器或 CLI 时可通过 shell 设置。例如：
 
 ```bash
 export X_POSTER_HEADLESS=0

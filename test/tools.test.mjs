@@ -16,7 +16,7 @@ process.env.X_POSTER_CHROME_PATH = '/fake/chrome';
 const { config, saveState, loadState } = await import('../server/config.mjs');
 const { appendHistory, readHistory } = await import('../server/limits.mjs');
 const { status, post, preview, schedule, listScheduled, cancelScheduled, login, exclusive, callTool, openUserWindow,
-  articleDraft, articleCover, articlePublish, articleDelete } = await import('../server/tools.mjs');
+  articleDraft, articleCover, articlePublish, articleDelete, pendingWork, waitForShutdown } = await import('../server/tools.mjs');
 const articlePath = join(home, 'article.md');
 await writeFile(articlePath, '# Title\n正文');
 const articleCoverPath = join(home, 'cover.png');
@@ -53,6 +53,44 @@ test('mutex keeps operations sequential and survives a rejection', async () => {
   await rejected;
   await second;
   assert.deepEqual(calls, ['first', 'second']);
+});
+
+test('shutdown waits for the entire browser queue, including rejected work', { timeout: 5000 }, async t => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  let release;
+  const first = exclusive(() => new Promise(resolve => { release = resolve; }));
+  const second = exclusive(() => { throw new XPosterError('UNCERTAIN', '模拟失败。'); });
+  const rejected = assert.rejects(second, error => error.code === 'UNCERTAIN');
+  let stopped = false;
+  const shutdown = waitForShutdown().then(() => { stopped = true; });
+  await Promise.resolve();
+  t.mock.timers.tick(179000);
+  await Promise.resolve();
+  assert.equal(stopped, false);
+  release();
+  await first;
+  await rejected;
+  await shutdown;
+  assert.equal(stopped, true);
+  await pendingWork();
+});
+
+test('shutdown grace deadline bounds a stuck job without cancelling it', { timeout: 5000 }, async t => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  const original = config.shutdownGraceSec;
+  config.shutdownGraceSec = 2;
+  t.after(() => { config.shutdownGraceSec = original; });
+  let release;
+  let finished = false;
+  const work = exclusive(() => new Promise(resolve => { release = resolve; })).then(() => { finished = true; });
+  const shutdown = waitForShutdown();
+  await Promise.resolve();
+  t.mock.timers.tick(2000);
+  await shutdown;
+  assert.equal(finished, false);
+  release();
+  await work;
+  assert.equal(finished, true);
 });
 
 test('input and wait_seconds fail before any browser work', async t => {

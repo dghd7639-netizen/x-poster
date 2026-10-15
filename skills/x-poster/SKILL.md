@@ -3,7 +3,7 @@ name: x-poster
 description: >-
   通过本机 Chrome 预览、发布和预排期 X 推文，从 Markdown 创建、发布和删除 X 长文章草稿，并为已有草稿设置封面。
   用户说“发推”“发 X”“发推特”“把这段话/这张图发到 X”（包括“把这段话发到 X”“把这张图发到 X”）、
-  “post to X”“post on Twitter”“tweet this”“发布 X 文章”或“Markdown 转 X Article”时使用；提供推文、排期和文章的十一个 MCP 工具。
+  “post to X”“post on Twitter”“tweet this”“发布 X 文章”或“Markdown 转 X Article”时使用；提供推文、排期和文章的十二个 MCP 工具（12 个）。
 ---
 
 # X 推文发布
@@ -67,9 +67,10 @@ description: >-
 
 1. 获取本地 `.md` 文件路径。用户只给文字时，先将文字写入 `.md` 文件，保留用户内容。MCP `markdown_path` 必须是绝对路径，最多 1 MB；标题来自参数 `title`、front matter `title:` 或首个 `# `（优先级从高到低），正文不能为空。
 2. 调用 `x_article_draft({ markdown_path, title?, cover? })`，每次都会**新建**草稿，永不编辑已有草稿。正文图片使用相对于 Markdown 目录的本地路径，最多 50 张、每组最多 4 张；远程图片不下载，会跳过并警告。格式及大小遵循推文图片规则。可选封面通过 front matter `cover:` 或绝对路径参数 `cover` 提供，参数优先；仅支持 jpg/jpeg/png/webp，最多 5 MB。
-3. 展示返回的**截图、标题、所有 warnings、article_id 和 edit_url**。用户也可打开 `edit_url` 完整审阅；截图只覆盖当前视口。`##` 映射为文章“标题”，`###`–`######` 为“副标题”；嵌套列表展平，代码块和表格降级为普通段落，分割线跳过，原始 HTML 按文字处理。
-4. 询问用户是否发布**这一份草稿**，等待明确确认。用户选择“只要草稿”时立即结束。文章始终先创建草稿作为预览，即使用户提出直接发布，也需先展示并确认这个 id。
-5. 确认后调用 `x_article_publish({ article_id })`，回报返回的 id 和链接（如有）。该操作公开文章，计入与推文共用的发布额度，还需遵循 Codex 每次工具审批。
+3. 长文章可能返回 `status: "in_progress"` 和 `job_id`；此时反复调用只读、幂等的 `x_article_status({ job_id })`，无需审批，直到获得最终结果或错误。已知草稿 id 时会同时返回 `article_id` 和 `edit_url`。任务进行中或收到 `UNCERTAIN` 后，绝不要为同一个文件再次调用 `x_article_draft`，否则会创建重复草稿。完成的任务保留 1 小时；服务器重启、任务未知或过期时，先检查 https://x.com/compose/articles，不要盲目重建。
+4. 展示返回的**截图、标题、所有 warnings、article_id 和 edit_url**。用户也可打开 `edit_url` 完整审阅；截图只覆盖当前视口。`##` 映射为文章“标题”，`###`–`######` 为“副标题”；嵌套列表展平，代码块和表格降级为普通段落，分割线跳过，原始 HTML 按文字处理。
+5. 询问用户是否发布**这一份草稿**，等待明确确认。用户选择“只要草稿”时立即结束。文章始终先创建草稿作为预览，即使用户提出直接发布，也需先展示并确认这个 id。
+6. 确认后调用 `x_article_publish({ article_id })`，回报返回的 id 和链接（如有）。该操作公开文章，计入与推文共用的发布额度，还需遵循 Codex 每次工具审批。
 
 用户要求修改正文时，优先让用户在 X 编辑；也可向用户确认删除刚创建的草稿，再调用 `x_article_delete({ article_id })`，从修改后的 Markdown 重新创建并审阅确认。不得未经确认就自动删除重建。**绝不删除插件未创建的草稿，除非用户明确提供 article_id 并确认删除该 id。** 删除不计入发布额度，也不退还原来发布的额度；Codex 每次删除需审批。
 

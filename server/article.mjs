@@ -231,6 +231,72 @@ function snapshot(selectors) {
   };
 }
 
+function textChars(text) { return text.replace(/\s/g, '').length; }
+
+function editorStats(page) {
+  return page.call(selector => {
+    const composer = document.querySelector(selector);
+    return {
+      blocks: composer.querySelectorAll('[data-block=true]').length,
+      textChars: [...composer.querySelectorAll('[data-text=true]')]
+        .reduce((sum, el) => sum + (el.textContent || '').replace(/\s/g, '').length, 0),
+    };
+  }, ARTICLE_SELECTORS.composer);
+}
+
+async function waitEditorSettled(page, articleId) {
+  const deadline = Date.now() + 5000;
+  await delay(1000);
+  let previous = await editorStats(page);
+  while (Date.now() + 250 <= deadline) {
+    await delay(250);
+    const current = await editorStats(page);
+    if (current.blocks === previous.blocks && current.textChars === previous.textChars) return;
+    previous = current;
+  }
+  throw uncertain(articleId, '文章图片插入后编辑器未稳定，请检查草稿。');
+}
+
+async function focusComposer(page) {
+  await page.press('Escape');
+  await page.call(selector => document.querySelector(selector).focus(), ARTICLE_SELECTORS.composer);
+  await page.press('DocumentEnd');
+}
+
+async function waitTextGain(page, before, minimum) {
+  const deadline = Date.now() + 5000;
+  for (;;) {
+    const gain = (await editorStats(page)).textChars - before;
+    if (gain >= minimum || Date.now() >= deadline) return gain;
+    await delay(Math.min(250, deadline - Date.now()));
+  }
+}
+
+async function pasteSegment(page, segment, articleId) {
+  const before = (await editorStats(page)).textChars;
+  const minimum = Math.max(1, Math.floor(0.6 * textChars(segment.text)));
+  const failure = () => uncertain(articleId, '文章正文粘贴不完整，草稿可能缺少内容。');
+  for (let attempt = 0; attempt < 2; attempt++) {
+    if (attempt) {
+      await delay(1000);
+      await focusComposer(page);
+      // The original paste may arrive late; never duplicate a nonzero gain.
+      const gain = (await editorStats(page)).textChars - before;
+      if (gain >= minimum) return;
+      if (gain !== 0) throw failure();
+    }
+    await page.call((selector, html, text) => {
+      const composer = document.querySelector(selector);
+      const data = new DataTransfer();
+      data.setData('text/html', html); data.setData('text/plain', text);
+      composer.dispatchEvent(new ClipboardEvent('paste', { clipboardData: data, bubbles: true, cancelable: true }));
+    }, ARTICLE_SELECTORS.composer, segment.html, segment.text);
+    const gain = await waitTextGain(page, before, minimum);
+    if (gain >= minimum) return;
+    if (gain !== 0 || attempt === 1) throw failure();
+  }
+}
+
 async function waitCoverImage(page) {
   const deadline = Date.now() + 20000;
   for (;;) {
@@ -240,16 +306,35 @@ async function waitCoverImage(page) {
   }
 }
 
+async function openMediaDialog(page, before) {
+  for (let attempts = 1; attempts <= 3; attempts++) {
+    if (attempts > 1 && (await page.call(snapshot, ARTICLE_SELECTORS)).images > before) {
+      throw new XPosterError('UNCERTAIN', '文章图片数量已增加，无法安全重试上传。', {
+        hint: `不要自动重试，请检查 ${ARTICLES_URL} 的草稿。`,
+      });
+    }
+    await clickWhenReady(page, ARTICLE_SELECTORS.insert);
+    if (!await page.waitFor(selectors => !!document.querySelector(selectors.menuItem), [ARTICLE_SELECTORS], { timeout: 10000 })) {
+      throw new XPosterError('UI_CHANGED', '文章插入菜单未打开。');
+    }
+    await clickAction(page, 'media');
+    if (await page.waitFor(selector => !!document.querySelector(selector), [ARTICLE_SELECTORS.mediaInput], { timeout: 2000 })) return;
+    // Capturing a frame can wake a media dialog whose file input has not rendered.
+    await page.screenshot().catch(() => {});
+    if (await page.waitFor(selector => !!document.querySelector(selector), [ARTICLE_SELECTORS.mediaInput], { timeout: 3000 })) return;
+    if (attempts === 3) throw new XPosterError('UI_CHANGED', '文章媒体上传窗口未打开。', { attempts });
+    const close = '[role=dialog] [data-testid=app-bar-close]';
+    if (await page.call(selector => !!document.querySelector(selector), close)) await clickWhenReady(page, close);
+    else await page.press('Escape');
+    if (!await page.waitFor(selector => !document.querySelector(selector), [ARTICLE_SELECTORS.dialog], { timeout: 3000 })) {
+      throw new XPosterError('UI_CHANGED', '文章媒体上传窗口未打开。', { attempts });
+    }
+  }
+}
+
 async function insertImages(page, paths) {
   const before = (await page.call(snapshot, ARTICLE_SELECTORS)).images;
-  await clickWhenReady(page, ARTICLE_SELECTORS.insert);
-  if (!await page.waitFor(selectors => !!document.querySelector(selectors.menuItem), [ARTICLE_SELECTORS], { timeout: 10000 })) {
-    throw new XPosterError('UI_CHANGED', '文章插入菜单未打开。');
-  }
-  await clickAction(page, 'media');
-  if (!await page.waitFor(selector => !!document.querySelector(selector), [ARTICLE_SELECTORS.mediaInput], { timeout: 10000 })) {
-    throw new XPosterError('UI_CHANGED', '文章媒体上传窗口未打开。');
-  }
+  await openMediaDialog(page, before);
   await page.setFiles(ARTICLE_SELECTORS.mediaInput, paths);
   const complete = await page.waitFor((selectors, expected) => {
     const composer = document.querySelector(selectors.composer);
@@ -326,7 +411,7 @@ async function waitSaved(page, watcher, mark, savedBefore, lastEdit, id) {
   throw uncertain(id, '无法确认文章已完整自动保存，草稿可能不完整。');
 }
 
-export async function createArticleDraft(browser, { title, segments, cover, screenshotPath }) {
+export async function createArticleDraft(browser, { title, segments, cover, screenshotPath, onArticleId }) {
   const page = await browser.newPage();
   const watcher = watchRequests(page);
   let articleId;
@@ -339,6 +424,7 @@ export async function createArticleDraft(browser, { title, segments, cover, scre
     await page.click(ARTICLE_SELECTORS.create);
     articleId = await page.waitFor(() => location.pathname.match(/^\/compose\/articles\/edit\/(\d+)$/)?.[1]);
     if (!articleId) throw new XPosterError('UNCERTAIN', '无法确认新文章草稿的 id。', { hint: `不要自动重试，请检查 ${ARTICLES_URL} 的草稿。` });
+    onArticleId?.(articleId);
     await waitEditor(page, watcher, articleId);
     await page.call(() => {
       const title = [...document.querySelectorAll('textarea')].find(el => /标题|title/i.test(el.placeholder));
@@ -349,26 +435,14 @@ export async function createArticleDraft(browser, { title, segments, cover, scre
     let savedBefore;
     let lastEdit;
     for (const segment of segments) {
-      await page.press('Escape');
-      await page.call(selector => document.querySelector(selector).focus(), ARTICLE_SELECTORS.composer);
-      await page.press('DocumentEnd');
+      await focusComposer(page);
       savedBefore = (await page.call(snapshot, ARTICLE_SELECTORS)).saved;
       mark = watcher.mark();
+      if (segment.type === 'images') {
+        await insertImages(page, segment.paths);
+        await waitEditorSettled(page, articleId);
+      } else await pasteSegment(page, segment, articleId);
       lastEdit = Date.now();
-      if (segment.type === 'images') await insertImages(page, segment.paths);
-      else {
-        const before = (await page.call(snapshot, ARTICLE_SELECTORS)).text;
-        await page.call((selector, html, text) => {
-          const composer = document.querySelector(selector);
-          const data = new DataTransfer();
-          data.setData('text/html', html); data.setData('text/plain', text);
-          composer.dispatchEvent(new ClipboardEvent('paste', { clipboardData: data, bubbles: true, cancelable: true }));
-        }, ARTICLE_SELECTORS.composer, segment.html, segment.text);
-        if (!await page.waitFor((selectors, before) => {
-          const composer = document.querySelector(selectors.composer);
-          return (composer?.innerText || composer?.textContent || '') !== before;
-        }, [ARTICLE_SELECTORS, before], { timeout: 5000 })) throw uncertain(articleId, '文章编辑器没有接受正文，草稿可能不完整。');
-      }
     }
     await page.press('Escape');
     if (cover) {
@@ -383,13 +457,17 @@ export async function createArticleDraft(browser, { title, segments, cover, scre
     await page.call(selector => { window.scrollTo(0, 0); document.querySelector(selector)?.scrollIntoView({ block: 'start' }); }, 'textarea');
     const warning = cover ? await waitCoverImage(page) : undefined;
     if (cover) final = await page.call(snapshot, ARTICLE_SELECTORS);
+    const textExpected = segments.reduce((sum, segment) => sum + (segment.type === 'images' ? 0 : textChars(segment.text)), 0);
+    const textInserted = (await editorStats(page)).textChars;
+    if (textInserted < 0.9 * textExpected) throw uncertain(articleId, '文章正文字数与 Markdown 不一致，请检查草稿。');
     if (final.title !== title || !final.text.trim() && !final.images || final.images !== expected || !!cover && !final.cover) {
       throw uncertain(articleId, '文章标题、正文、图片数量或封面与预期不一致，请检查草稿。');
     }
     const screenshot = await page.screenshot();
     await writeFile(screenshotPath, screenshot, { mode: 0o600 });
     return { article_id: articleId, edit_url: editURL(articleId), title, images_inserted: final.images,
-      images_expected: expected, cover: final.cover, word_count_text: final.wordCount, screenshot, ...(warning ? { warning } : {}) };
+      images_expected: expected, text_chars_inserted: textInserted, text_chars_expected: textExpected,
+      cover: final.cover, word_count_text: final.wordCount, screenshot, ...(warning ? { warning } : {}) };
   } catch (error) {
     if (articleId) {
       if (!(error instanceof XPosterError)) throw uncertain(articleId, '已创建文章草稿，但后续操作未完成，请检查草稿。');
