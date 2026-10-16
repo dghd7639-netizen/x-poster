@@ -7,9 +7,10 @@ import { tmpdir, homedir } from 'node:os';
 import { join, relative } from 'node:path';
 import { createArticleDraft, setArticleCover, publishArticle, deleteArticleDraft, ARTICLE_SELECTORS as S } from '../server/article.mjs';
 import { Browser } from '../server/chrome.mjs';
+import { holdsLock } from '../server/lock.mjs';
 import { XPosterError } from '../server/errors.mjs';
 import { config } from '../server/config.mjs';
-import { articleDraft, articleCover, articlePublish, articleDelete, callTool, pendingWork } from '../server/tools.mjs';
+import { articleDraft, articleCover, articlePublish, articleDelete, callTool, pendingWork, exclusive } from '../server/tools.mjs';
 import { readHistory, checkRateLimit } from '../server/limits.mjs';
 
 const test = (name, fn) => nodeTest(name, { timeout: 5000 }, fn);
@@ -290,7 +291,7 @@ function fixture(options = {}) {
 }
 
 const clockTimes = new WeakMap();
-async function runClock(t, action) {
+async function runClock(t, action, browserWork = false) {
   const now = Math.max(Date.now(), clockTimes.get(t) ?? 0);
   t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now });
   let outcome;
@@ -304,7 +305,8 @@ async function runClock(t, action) {
     while (!outcome) {
       await new Promise(resolve => setImmediate(resolve));
       assert.ok(performance.now() < deadline, 'virtual-clock operation did not settle within 2 seconds');
-      if (!outcome) t.mock.timers.runAll();
+      // Let real lock I/O finish before advancing simulated browser timers.
+      if (!outcome && (!browserWork || holdsLock(join(config.home, 'browser.lock')))) t.mock.timers.runAll();
     }
     if ('error' in outcome) throw outcome.error;
     return outcome.value;
@@ -313,6 +315,8 @@ async function runClock(t, action) {
     t.mock.timers.reset();
   }
 }
+
+function runToolClock(t, action) { return runClock(t, action, true); }
 
 async function input(t, extra = {}) {
   const dir = await mkdtemp(join(tmpdir(), 'x-poster-article-'));
@@ -732,14 +736,14 @@ test('draft MCP returns image, warnings and review instructions with no publicat
 
 test('publish records history and consumes limits; delete remains usable at the limit', async t => {
   const f = await toolFixture(t);
-  const result = await runClock(t, () => articlePublish({ article_id: '123' }));
+  const result = await runToolClock(t, () => articlePublish({ article_id: '123' }));
   assert.equal(result.data.article_id, '123');
   const history = await readHistory(config.historyFile);
   assert.deepEqual(Object.keys(history[0]).sort(), ['article_id', 'ts', 'url']);
   assert.equal(history[0].article_id, '123');
   await assert.rejects(articlePublish({ article_id: '123' }), error => error.code === 'RATE_LIMITED');
   assert.equal(f.opened.mock.callCount(), 1);
-  await runClock(t, () => articleDelete({ article_id: '123' }));
+  await runToolClock(t, () => articleDelete({ article_id: '123' }));
   const after = await readHistory(config.historyFile);
   assert.equal(after[1].deleted_article, '123');
   const limits = { now: Date.now(), minIntervalSec: 60, dailyLimit: 20 };
@@ -748,7 +752,7 @@ test('publish records history and consumes limits; delete remains usable at the 
 
 test('uncertain article publication is counted once and not retried', async t => {
   const f = await toolFixture(t, { noPublish: true });
-  const result = await runClock(t, () => callTool('x_article_publish', { article_id: '123' }));
+  const result = await runToolClock(t, () => callTool('x_article_publish', { article_id: '123' }));
   assert.equal(JSON.parse(result.content[0].text).code, 'UNCERTAIN');
   const history = await readHistory(config.historyFile);
   assert.equal(history.length, 1);
@@ -831,7 +835,7 @@ test('history write failure after successful article operations stays UNCERTAIN'
   const f = await toolFixture(t);
   config.historyFile = f.dir;
   t.mock.method(console, 'error', () => {});
-  await assert.rejects(runClock(t, () => articleDelete({ article_id: '123' })), error => error.code === 'UNCERTAIN' && /历史记录/.test(error.message));
+  await assert.rejects(runToolClock(t, () => articleDelete({ article_id: '123' })), error => error.code === 'UNCERTAIN' && /历史记录/.test(error.message));
   assert.equal(f.state.browserClosed, true);
 });
 
@@ -1064,7 +1068,7 @@ test('cover MCP returns image content without changing history or consuming limi
   await writeFile(cover, 'image');
   const history = `${JSON.stringify({ ts: new Date().toISOString(), article_id: '999' })}\n`;
   await writeFile(config.historyFile, history);
-  const result = await runClock(t, () => callTool('x_article_cover', { article_id: '123', cover }));
+  const result = await runToolClock(t, () => callTool('x_article_cover', { article_id: '123', cover }));
   assert.equal(result.isError, undefined);
   const data = JSON.parse(result.content[0].text);
   assert.equal(data.replaced, true);
@@ -1091,7 +1095,7 @@ test('cover MCP expands home paths and accepts the 5 MB boundary', async t => {
   const cover = join(f.dir, 'cover.JPEG');
   await writeFile(cover, 'image');
   await truncate(cover, 5 * 1024 * 1024);
-  const result = await runClock(t, () => articleCover({ article_id: '123', cover: `~/${relative(homedir(), cover)}` }));
+  const result = await runToolClock(t, () => articleCover({ article_id: '123', cover: `~/${relative(homedir(), cover)}` }));
   assert.equal(result.data.cover, true);
   assert.deepEqual(f.calls.find(call => call[0] === 'files')[2], [cover]);
 });
@@ -1100,7 +1104,7 @@ test('uncertain cover MCP keeps history unchanged and includes the draft id', as
   const f = await toolFixture(t, { noSave: true });
   const cover = join(f.dir, 'cover.png');
   await writeFile(cover, 'image');
-  const result = await runClock(t, () => callTool('x_article_cover', { article_id: '123', cover }));
+  const result = await runToolClock(t, () => callTool('x_article_cover', { article_id: '123', cover }));
   assert.equal(result.isError, true);
   const failure = JSON.parse(result.content[0].text);
   assert.equal(failure.code, 'UNCERTAIN');
@@ -1349,7 +1353,7 @@ test('cover MCP returns success and warning without image when screenshot fails 
   const f = await toolFixture(t, { screenshotError: true });
   const cover = join(f.dir, 'cover.png');
   await writeFile(cover, 'image');
-  const result = await runClock(t, () => callTool('x_article_cover', { article_id: '123', cover }));
+  const result = await runToolClock(t, () => callTool('x_article_cover', { article_id: '123', cover }));
   assert.equal(result.isError, undefined);
   const data = JSON.parse(result.content[0].text);
   assert.equal(data.ok, true);
@@ -1554,6 +1558,7 @@ test('slow draft exposes its id, repeated status waits, and later returns the fi
   assert.equal(f.progress.isError, undefined);
   assert.equal(f.data.ok, true);
   assert.equal(f.data.status, 'in_progress');
+  assert.equal(f.data.waiting_for_browser, false);
   assert.equal(f.data.article_id, '123');
   assert.equal(f.data.edit_url, 'https://x.com/compose/articles/edit/123');
   assert.equal(f.data.elapsed_sec, 45);
@@ -1661,4 +1666,72 @@ test('CLI draft entry waits past the MCP deadline and returns only the final res
   assert.equal(result.data.status, undefined);
   assert.equal(result.data.job_id, undefined);
   assert.ok(Buffer.isBuffer(result.image));
+});
+
+
+test('empty and whitespace-only text segments paste once without gain checks or retries', async t => {
+  const f = fixture();
+  const args = await input(t, { segments: [
+    { type: 'images', paths: ['/tmp/one.png'] },
+    { type: 'html', html: '<p><br></p>', text: '' },
+    { type: 'html', html: '<p> </p>', text: ' \n' },
+    { type: 'images', paths: ['/tmp/two.png'] },
+  ] });
+  const result = await runClock(t, () => createArticleDraft(f.browser, args));
+  assert.deepEqual(f.calls.filter(call => call[0] === 'paste').map(call => call[1]), ['', ' \n']);
+  assert.equal(result.text_chars_expected, 0);
+  assert.equal(result.text_chars_inserted, 0);
+  assert.equal(result.images_inserted, 2);
+});
+
+
+test('article jobs wait beyond the synchronous limit and expose browser waiting status', async t => {
+  const f = await toolFixture(t);
+  config.busyWaitSec = 1;
+  config.toolWaitSec = 0.01;
+  const entered = deferred();
+  const gate = deferred();
+  const blocker = exclusive(async () => { entered.resolve(); await gate.promise; });
+  await entered.promise;
+  try {
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: Date.now() });
+    const draft = await jobClock(t, callTool('x_article_draft', { markdown_path: f.markdown_path }));
+    const data = JSON.parse(draft.content[0].text);
+    assert.equal(data.status, 'in_progress');
+    assert.equal(data.waiting_for_browser, true);
+    const synchronous = await jobClock(t, callTool('x_status', {}));
+    assert.equal(JSON.parse(synchronous.content[0].text).code, 'BUSY');
+    const poll = JSON.parse((await jobClock(t, callTool('x_article_status', { job_id: data.job_id }))).content[0].text);
+    assert.equal(poll.status, 'in_progress');
+    assert.equal(poll.waiting_for_browser, true);
+    assert.equal(f.opened.mock.callCount(), 0);
+    config.toolWaitSec = 45;
+    gate.resolve();
+    await jobClock(t, pendingWork());
+    const done = JSON.parse((await callTool('x_article_status', { job_id: data.job_id })).content[0].text);
+    assert.equal(done.article_id, '123');
+    assert.equal(done.status, undefined);
+    assert.equal(f.opened.mock.callCount(), 1);
+  } finally { gate.resolve(); await blocker; }
+});
+
+test('article browser wait ends with BUSY after fifteen simulated minutes without creating a draft', async t => {
+  const f = await toolFixture(t);
+  config.toolWaitSec = 0.01;
+  const entered = deferred();
+  const gate = deferred();
+  const blocker = exclusive(async () => { entered.resolve(); await gate.promise; });
+  await entered.promise;
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: Date.now() });
+  try {
+    const result = await jobClock(t, callTool('x_article_draft', { markdown_path: f.markdown_path }));
+    const data = JSON.parse(result.content[0].text);
+    assert.equal(data.waiting_for_browser, true);
+    t.mock.timers.tick(15 * 60 * 1000);
+    const final = await jobClock(t, callTool('x_article_status', { job_id: data.job_id }));
+    assert.equal(final.isError, true);
+    assert.equal(JSON.parse(final.content[0].text).code, 'BUSY');
+    assert.equal(f.opened.mock.callCount(), 0);
+  } finally { gate.resolve(); await blocker; await pendingWork(); }
+  assert.equal(f.opened.mock.callCount(), 0);
 });

@@ -18,6 +18,11 @@ function toolWaitSetting(value) {
   return Number.isFinite(parsed) ? Math.max(5, Math.min(300, parsed)) : 45;
 }
 
+function busyWaitSetting(value) {
+  const parsed = value?.trim() ? Number(value) : NaN;
+  return Number.isFinite(parsed) ? Math.max(1, Math.min(120, parsed)) : 15;
+}
+
 const home = resolve(expandHome(process.env.X_POSTER_HOME || '~/.x-poster'));
 export const config = {
   home,
@@ -30,6 +35,7 @@ export const config = {
   foreground: /^(1|true|yes|on)$/i.test(process.env.X_POSTER_FOREGROUND || ''),
   minIntervalSec: numberSetting(process.env.X_POSTER_MIN_INTERVAL_SEC, 60),
   dailyLimit: numberSetting(process.env.X_POSTER_DAILY_LIMIT, 20),
+  busyWaitSec: busyWaitSetting(process.env.X_POSTER_BUSY_WAIT_SEC),
   toolWaitSec: toolWaitSetting(process.env.X_POSTER_TOOL_WAIT_SEC),
   shutdownGraceSec: numberSetting(process.env.X_POSTER_SHUTDOWN_GRACE_SEC, 180),
 };

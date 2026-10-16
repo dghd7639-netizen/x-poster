@@ -1,10 +1,11 @@
 import { existsSync } from 'node:fs';
 import { mkdir, readFile, readlink, unlink } from 'node:fs/promises';
-import { join, delimiter } from 'node:path';
+import { join, dirname, delimiter } from 'node:path';
 import { homedir } from 'node:os';
 import { spawn, execFile } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
 import { XPosterError } from './errors.mjs';
+import { holdsLock } from './lock.mjs';
 
 export function findChrome() {
   let candidates;
@@ -158,16 +159,15 @@ export async function openPlainWindow({ profileDir, executablePath, url }) {
   });
 }
 
-export async function profileInUse(profileDir) {
-  if (process.platform === 'win32') return false;
-  const pid = await profilePid(profileDir);
+function pidAlive(pid, kill) {
   if (!pid) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return error.code === 'EPERM';
-  }
+  try { kill(pid, 0); return true; }
+  catch (error) { return error.code !== 'ESRCH'; }
+}
+
+export async function profileInUse(profileDir, { platform = process.platform, kill = process.kill } = {}) {
+  if (platform === 'win32') return false;
+  return pidAlive(await profilePid(profileDir), kill);
 }
 
 async function profilePid(profileDir) {
@@ -197,8 +197,31 @@ async function endpoint(profileDir) {
   return null;
 }
 
-async function launch({ profileDir, executablePath, headless, foreground }, runtime) {
+async function launchedProfilePid(profileDir, previous) {
+  const pid = await profilePid(profileDir);
+  return pid && (pid !== previous.pid || !previous.alive) ? pid : null;
+}
+
+export async function cleanupLaunch({ child, cdp, pid, profileDir, previous, lockPath }, runtime) {
+  try {
+    if (child) child.kill();
+    else {
+      pid ??= await launchedProfilePid(profileDir, previous);
+      // Never close or kill an unproven browser, or one whose operation lock we no longer hold.
+      if (pid && holdsLock(lockPath)) {
+        if (cdp) await cdp.send('Browser.close', {}, undefined, 2000).catch(() => {});
+        try { runtime.kill(pid, 'SIGKILL'); } catch { /* The browser may already have exited. */ }
+      }
+    }
+  } finally { cdp?.close(); }
+}
+
+async function launch({ profileDir, executablePath, headless, foreground, lockPath }, runtime) {
   await mkdir(profileDir, { recursive: true, mode: 0o700 });
+  const previous = { pid: await profilePid(profileDir) };
+  previous.alive = pidAlive(previous.pid, runtime.kill);
+  // Browser.open checks profileInUse first; recheck here before removing a live browser's endpoint.
+  if (previous.alive || await profileInUse(profileDir, runtime)) throw profileBusy();
   await unlink(join(profileDir, 'DevToolsActivePort')).catch(error => {
     if (error.code !== 'ENOENT') throw error;
   });
@@ -227,6 +250,7 @@ async function launch({ profileDir, executablePath, headless, foreground }, runt
     child.once('exit', () => children.delete(child));
   }
   let cdp;
+  let pid = null;
   try {
     const deadline = runtime.now() + 20000;
     while (runtime.now() < deadline) {
@@ -236,15 +260,16 @@ async function launch({ profileDir, executablePath, headless, foreground }, runt
       const url = await endpoint(profileDir);
       if (url) {
         cdp = await runtime.connect(url);
-        let pid = null;
         if (background) {
           try {
             const { processInfo } = await cdp.send('SystemInfo.getProcessInfo', {}, undefined, 2000);
             const id = processInfo?.find(info => info.type === 'browser')?.id;
             if (Number.isSafeInteger(id) && id > 0) pid = id;
           } catch { /* Older browsers may not expose SystemInfo. */ }
-          pid ??= await profilePid(profileDir);
-          if (!pid) throw new XPosterError('BROWSER_LAUNCH_FAILED', '无法确定后台 Chrome 的进程。');
+          pid ??= await launchedProfilePid(profileDir, previous);
+          if (!pid) throw new XPosterError('BROWSER_LAUNCH_FAILED', '无法确定后台 Chrome 的进程。', {
+            hint: '无法确认进程归属，未关闭或终止已有 Chrome。请检查专用配置目录的浏览器后再试。',
+          });
         }
         return { cdp, child, pid, background };
       }
@@ -257,17 +282,7 @@ async function launch({ profileDir, executablePath, headless, foreground }, runt
     }
     throw new XPosterError('BROWSER_LAUNCH_FAILED', 'Chrome 启动超时。', { hint: '请检查浏览器能否正常启动。' });
   } catch (error) {
-    if (child) child.kill();
-    else {
-      const pid = await profilePid(profileDir);
-      if (cdp) {
-        await cdp.send('Browser.close', {}, undefined, 2000).catch(() => {});
-        cdp.close();
-      }
-      if (pid) {
-        try { runtime.kill(pid, 'SIGKILL'); } catch { /* The browser may already have exited. */ }
-      }
-    }
+    await cleanupLaunch({ child, cdp, pid, profileDir, previous, lockPath }, runtime);
     if (error instanceof XPosterError) throw error;
     throw new XPosterError('BROWSER_LAUNCH_FAILED', 'Chrome 启动后无法连接。', { hint: '请关闭此配置目录的 Chrome 后再试。' });
   }
@@ -290,7 +305,7 @@ export class Browser {
     this.closePromise = null;
   }
 
-  static async open({ profileDir, executablePath, headless, foreground }, dependencies = {}) {
+  static async open({ profileDir, executablePath, headless, foreground, lockPath = join(dirname(profileDir), 'browser.lock') }, dependencies = {}) {
     const runtime = { platform: process.platform, spawn, execFile, connect: CDPConnection.connect,
       now: Date.now, delay, kill: (pid, signal) => process.kill(pid, signal), ...dependencies };
     const url = await endpoint(profileDir);
@@ -298,7 +313,7 @@ export class Browser {
       try { return new Browser(await runtime.connect(url, 2000), null, { runtime }); }
       catch { /* A stale port file is expected after an interrupted Chrome session. */ }
     }
-    if (await profileInUse(profileDir)) {
+    if (await profileInUse(profileDir, runtime)) {
       throw profileBusy();
     }
     if (!executablePath) {
@@ -308,7 +323,7 @@ export class Browser {
     }
     // Keep configuration lazy: Chrome helpers are also used before callers initialise their environment.
     foreground ??= (await import('./config.mjs')).config.foreground;
-    const { cdp, child, pid, background } = await launch({ profileDir, executablePath, headless, foreground }, runtime);
+    const { cdp, child, pid, background } = await launch({ profileDir, executablePath, headless, foreground, lockPath }, runtime);
     return new Browser(cdp, child, { pid, background, runtime });
   }
 

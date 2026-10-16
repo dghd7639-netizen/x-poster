@@ -99,7 +99,7 @@ node server/cli.mjs login
 
 MCP `x_login` 的 `wait_seconds` 默认是 `0`，立即返回 `waiting_for_user`（已登录时为 `window_open`）；设为 1–300 时最多等待相应秒数，期间用户完全退出该 Chrome 后检查登录态并返回 `logged_in` 和 `status`，否则返回等待状态，普通窗口继续保持打开。没有登录窗口时限，服务重启也不会主动终止它。已登录时，`x_login` 打开 X 主页，方便用户处理验证提示；完成后同样需要完全退出该 Chrome。窗口仍在运行时，`x_status`、`x_preview`、`x_post`、`x_schedule`、`x_list_scheduled`、`x_cancel_scheduled` 会返回 `LOGIN_IN_PROGRESS` 或 `BROWSER_BUSY`。
 
-默认登录态由 Claude Code 和 Codex 共用。如果为不同宿主配置不同的 `X_POSTER_HOME`，它们使用各自目录中的会话。
+Claude Code、Codex 和 Claude Desktop 可以同时安装，默认共用 `~/.x-poster` 的登录态。x-poster 通过跨进程的 `browser.lock` 保证同一数据目录一次只执行一个浏览器任务（包含关闭浏览器）。其他同步调用最多等待 `X_POSTER_BUSY_WAIT_SEC` 秒，默认 15 秒；到期返回 `BUSY`，本次操作没有执行，也不会在之后补执行。如果为不同宿主配置不同的 `X_POSTER_HOME`，它们使用各自目录中的会话。
 
 ## 使用方式
 
@@ -147,7 +147,7 @@ agent 先调用 `x_status`，必要时引导用户登录；准备文字和本地
 
 X Articles 是 `https://x.com/compose/articles` 的长文章编辑器，需要**具备文章权限的 X Premium 账号**；没有新建入口时返回 `ARTICLES_UNAVAILABLE`。新文章采用 **新建草稿 → 用户审阅截图或 `edit_url` → 明确确认该 `article_id` → 发布**。草稿就是预览，不会公开；只要草稿时到此停止。不要把草稿截图当作发布成功。
 
-多图长文章可能超过客户端约 60 秒的超时。`x_article_draft` 默认等待 45 秒；未完成时返回 `ok: true`、`status: "in_progress"`、`job_id`、`elapsed_sec`、`next_step`，已知草稿 id 时还返回 `article_id` 和 `edit_url`。此时反复调用 `x_article_status({ job_id })`，直到得到最终结果及图像或错误。**任务进行中或收到 `UNCERTAIN` 后，绝不要为同一个文件再次调用 `x_article_draft`，否则会创建重复草稿。**
+多图长文章可能超过客户端约 60 秒的超时。`x_article_draft` 默认等待 45 秒；未完成时返回 `ok: true`、`status: "in_progress"`、`job_id`、`elapsed_sec`、`next_step`，已知草稿 id 时还返回 `article_id` 和 `edit_url`。草稿任务等待浏览器时返回 `waiting_for_browser: true`，最多排队 15 分钟，开始执行后该字段变为 `false`；排队到期以 `BUSY` 结束任务。此时反复调用 `x_article_status({ job_id })`，直到得到最终结果及图像或错误。**任务进行中或收到 `UNCERTAIN` 后，绝不要为同一个文件再次调用 `x_article_draft`，否则会创建重复草稿。**
 
 任务存储在当前服务器进程内，完成后保留 1 小时，后续工具调用时清理。任务未知或过期时先检查 https://x.com/compose/articles，不要盲目重建。客户端取消请求不会取消草稿工作；stdin 关闭或收到 SIGTERM / SIGINT 时，服务器默认等待正在执行或排队的工作最多 180 秒；第二次 SIGINT 立即退出。退出宽限到期或进程重启后不能继续轮询旧任务，需到 X 核对草稿。CLI 的 `article-draft` 始终等待最终结果，不输出 `in_progress`。
 
@@ -210,6 +210,7 @@ node server/cli.mjs article-cover --id '123' --cover ./cover.png
 | `X_POSTER_FOREGROUND` | `0` | 设为 `1`（也支持 `true`、`yes`、`on`）后直接启动 Chrome，让窗口来到前台；macOS 默认在后台运行。 |
 | `X_POSTER_MIN_INTERVAL_SEC` | `60` | 两次发布之间的最小秒数；`0` 关闭此限制。 |
 | `X_POSTER_DAILY_LIMIT` | `20` | 滚动 24 小时的最大发布数量；`0` 关闭此限制。 |
+| `X_POSTER_BUSY_WAIT_SEC` | `15` | 同步 MCP 调用等待浏览器空闲的最长秒数，限制在 1–120；无效值回退默认。包括进程内排队及跨进程文件锁等待；到期返回 `BUSY`，不会执行。后台文章任务最多等 15 分钟，CLI 最多等 10 分钟。 |
 | `X_POSTER_TOOL_WAIT_SEC` | `45` | MCP 草稿创建／状态查询单次等待秒数，限制在 5–300；无效值回退默认。应小于客户端工具超时。CLI 始终等待完成。 |
 | `X_POSTER_SHUTDOWN_GRACE_SEC` | `180` | stdin 关闭或 SIGTERM / SIGINT 后等待工作完成的最长秒数；`0` 立即退出。 |
 
@@ -237,6 +238,8 @@ codex
 修改后重启宿主或 MCP 服务器使配置生效。
 
 ## CLI 使用
+
+CLI 等待浏览器空闲的期限为 10 分钟，等待时只向 stderr 提示一次；到期返回 `BUSY`，本次操作未执行。开始执行后仍等待最终结果。
 
 在仓库根目录运行 `node server/cli.mjs <command>`：
 
@@ -306,6 +309,7 @@ rm -rf ~/.x-poster/chrome-profile
 | `ARTICLES_UNAVAILABLE` | 当前账号没有文章新建入口；需要符合资格、具备文章权限的 X Premium 账号。 |
 | Google 提示“此浏览器或应用可能不安全” | Google 拒绝在启用了远程调试端口的浏览器中登录。按 Cmd+Q 完全退出占用专用 profile 的 Chrome（Windows/Linux 关闭它的所有窗口），再调用 `x_login` 使用普通登录窗口。 |
 | `NOT_LOGGED_IN` / 登录过期 | 调用 `x_login`，由用户重新登录并完全退出该 Chrome，再用 `x_status` 检查。 |
+| `BUSY` | **本次操作未执行，也不会稍后执行，可以稍后安全重试。** 如果有文章任务正在进行，先用 `x_article_status` 等它完成。`BUSY` 是唯一明确保证可安全重试的错误；`UNCERTAIN` 表示操作可能已经发生，绝不重试。 |
 | `LOGIN_IN_PROGRESS` / `BROWSER_BUSY` | 请用户完成已有登录或检查操作，在该 Chrome 中按 Cmd+Q 完全退出（Windows/Linux 关闭它的所有窗口），再调用 `x_status`。仅关闭标签页可能仍占用专用 profile。 |
 | `ACCOUNT_CHALLENGE` | 调用 `x_login`，由用户在普通窗口中自行完成验证，然后完全退出该 Chrome；不要绕过 CAPTCHA。 |
 | `RATE_LIMITED` | 按 `retry_after_sec` 等待，不循环尝试。 |
@@ -342,6 +346,7 @@ claude plugin validate .
 │   ├── index.mjs               MCP stdio 入口
 │   ├── tools.mjs               工具定义与处理
 │   ├── chrome.mjs              浏览器启动与 CDP
+│   ├── lock.mjs                跨进程浏览器任务锁及过期回收
 │   ├── x.mjs                   X 页面操作与 SELECTORS
 │   ├── article.mjs             长文章草稿、发布、删除与 ARTICLE_SELECTORS
 │   ├── markdown.mjs            零依赖 Markdown 解析及本地图片校验

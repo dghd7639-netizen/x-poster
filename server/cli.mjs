@@ -3,7 +3,7 @@ import { parseArgs } from 'node:util';
 import { resolve } from 'node:path';
 import { expandHome } from './config.mjs';
 import { XPosterError } from './errors.mjs';
-import { status, preview, post, schedule, listScheduled, cancelScheduled, openUserWindow, articleDraft, articleCover, articlePublish, articleDelete } from './tools.mjs';
+import { setBrowserWaitOptions, status, preview, post, schedule, listScheduled, cancelScheduled, openUserWindow, articleDraft, articleCover, articlePublish, articleDelete } from './tools.mjs';
 
 const usage = `x-poster 命令行（需要 Node.js 22 或更高版本）
 
@@ -85,6 +85,12 @@ async function main() {
     ...(values.at !== undefined ? { scheduled_at: values.at } : {}),
     images: (values.image ?? []).map(path => resolve(expandHome(path))),
   };
+  let waitingPrinted = false;
+  setBrowserWaitOptions({ maxWaitMs: 10 * 60 * 1000, onWait: () => {
+    if (waitingPrinted) return;
+    waitingPrinted = true;
+    console.error('x-poster 正在执行另一个浏览器任务，正在等待空闲（最多 10 分钟）；本次操作尚未执行。');
+  } });
   switch (command) {
     case 'status': print((await status()).data); return 0;
     case 'login': {

@@ -175,9 +175,10 @@ test('cancel can verify success even when no DeleteScheduledTweet response appea
 
 async function historyFixture(t) {
   const dir = await mkdtemp(join(tmpdir(), 'x-poster-cancel-'));
-  const original = config.historyFile;
+  const original = { ...config };
+  config.home = dir;
   config.historyFile = join(dir, 'history.jsonl');
-  t.after(async () => { config.historyFile = original; await rm(dir, { recursive: true, force: true }); });
+  t.after(async () => { Object.assign(config, original); await rm(dir, { recursive: true, force: true }); });
   return dir;
 }
 

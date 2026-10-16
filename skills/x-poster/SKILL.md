@@ -10,6 +10,8 @@ description: >-
 
 使用 MCP 服务器 `x-poster`，默认先预览、确认，再发布。
 
+`BUSY` 是唯一保证本次操作未执行、可稍后安全重试的错误；若有文章任务正在进行，先用 `x_article_status` 等它完成，`UNCERTAIN` 绝不重试。
+
 macOS 上自动化浏览器默认在后台运行，不抢焦点；需要查看时可点击 Chrome，或设置 `X_POSTER_FOREGROUND=1`，登录窗口仍在前台打开。
 
 ## 工作流程

@@ -273,8 +273,9 @@ async function waitTextGain(page, before, minimum) {
 }
 
 async function pasteSegment(page, segment, articleId) {
-  const before = (await editorStats(page)).textChars;
-  const minimum = Math.max(1, Math.floor(0.6 * textChars(segment.text)));
+  const chars = textChars(segment.text);
+  const before = chars ? (await editorStats(page)).textChars : 0;
+  const minimum = Math.max(1, Math.floor(0.6 * chars));
   const failure = () => uncertain(articleId, '文章正文粘贴不完整，草稿可能缺少内容。');
   for (let attempt = 0; attempt < 2; attempt++) {
     if (attempt) {
@@ -291,6 +292,7 @@ async function pasteSegment(page, segment, articleId) {
       data.setData('text/html', html); data.setData('text/plain', text);
       composer.dispatchEvent(new ClipboardEvent('paste', { clipboardData: data, bubbles: true, cancelable: true }));
     }, ARTICLE_SELECTORS.composer, segment.html, segment.text);
+    if (chars === 0) return;
     const gain = await waitTextGain(page, before, minimum);
     if (gain >= minimum) return;
     if (gain !== 0 || attempt === 1) throw failure();

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import childProcess from 'node:child_process';
 import { syncBuiltinESMExports } from 'node:module';
 import { EventEmitter } from 'node:events';
-import { mkdtemp, mkdir, writeFile, readFile, utimes, access, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, utimes, access, rm, unlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Browser, Page } from '../server/chrome.mjs';
@@ -40,14 +40,17 @@ function plainWindow(t, fail = false) {
 test('mutex keeps operations sequential and survives a rejection', async () => {
   const calls = [];
   let finish;
+  let started;
+  const entered = new Promise(resolve => { started = resolve; });
   const first = exclusive(async () => {
     calls.push('first');
+    started();
     await new Promise(resolve => { finish = resolve; });
     throw new Error('expected');
   });
   const rejected = assert.rejects(first, /expected/);
   const second = exclusive(() => calls.push('second'));
-  await Promise.resolve();
+  await entered;
   assert.deepEqual(calls, ['first']);
   finish();
   await rejected;
@@ -58,8 +61,11 @@ test('mutex keeps operations sequential and survives a rejection', async () => {
 test('shutdown waits for the entire browser queue, including rejected work', { timeout: 5000 }, async t => {
   t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
   let release;
-  const first = exclusive(() => new Promise(resolve => { release = resolve; }));
-  const second = exclusive(() => { throw new XPosterError('UNCERTAIN', '模拟失败。'); });
+  let started;
+  const entered = new Promise(resolve => { started = resolve; });
+  const first = exclusive(() => new Promise(resolve => { release = resolve; started(); }));
+  await entered;
+  const second = exclusive(() => { throw new XPosterError('UNCERTAIN', '模拟失败。'); }, { maxWaitMs: 300000 });
   const rejected = assert.rejects(second, error => error.code === 'UNCERTAIN');
   let stopped = false;
   const shutdown = waitForShutdown().then(() => { stopped = true; });
@@ -82,7 +88,10 @@ test('shutdown grace deadline bounds a stuck job without cancelling it', { timeo
   t.after(() => { config.shutdownGraceSec = original; });
   let release;
   let finished = false;
-  const work = exclusive(() => new Promise(resolve => { release = resolve; })).then(() => { finished = true; });
+  let started;
+  const entered = new Promise(resolve => { started = resolve; });
+  const work = exclusive(() => new Promise(resolve => { release = resolve; started(); })).then(() => { finished = true; });
+  await entered;
   const shutdown = waitForShutdown();
   await Promise.resolve();
   t.mock.timers.tick(2000);
@@ -567,4 +576,93 @@ test('scheduled list tool returns records and count without altering posting his
   assert.equal(closed, true);
   assert.equal(events.size, 0);
   assert.deepEqual(await readHistory(config.historyFile), []);
+});
+
+
+test('expired queue slots never execute and later calls retain their order', { timeout: 2000 }, async () => {
+  const calls = [];
+  let release;
+  let started;
+  const entered = new Promise(resolve => { started = resolve; });
+  const first = exclusive(async () => {
+    calls.push('first');
+    started();
+    await new Promise(resolve => { release = resolve; });
+  });
+  await entered;
+  const expired = exclusive(() => calls.push('expired'), { maxWaitMs: 20 });
+  const behind = exclusive(() => calls.push('behind'), { maxWaitMs: 1000 });
+  const last = exclusive(() => calls.push('last'), { maxWaitMs: 1000 });
+  try {
+    await assert.rejects(expired, error => {
+      assert.equal(error.code, 'BUSY');
+      assert.equal(error.toJSON().retry_after_sec, 30);
+      assert.match(error.hint, /没有执行.*安全重试.*x_article_status/);
+      return true;
+    });
+  } finally { release(); }
+  await Promise.all([first, behind, last]);
+  assert.deepEqual([...calls], ['first', 'behind', 'last']);
+});
+
+test('file lock wait expires without running and the next slot can still acquire', { timeout: 2000 }, async () => {
+  const { acquireLock } = await import('../server/lock.mjs');
+  const release = await acquireLock(join(home, 'browser.lock'), { tool: 'other process' });
+  const calls = [];
+  let notifications = 0;
+  const expired = exclusive(() => calls.push('expired'), { maxWaitMs: 30, onWait: () => notifications++ });
+  const next = exclusive(() => calls.push('next'), { maxWaitMs: 1500 });
+  try {
+    await assert.rejects(expired, error => error.code === 'BUSY');
+    assert.deepEqual(calls, []);
+    assert.equal(notifications, 1);
+  } finally { await release(); }
+  await next;
+  assert.deepEqual(calls, ['next']);
+});
+
+test('maxWaitMs covers the queue turn and file lock together', { timeout: 2000 }, async () => {
+  const { acquireLock } = await import('../server/lock.mjs');
+  let finish;
+  let entered;
+  const started = new Promise(resolve => { entered = resolve; });
+  const first = exclusive(async () => {
+    entered();
+    await new Promise(resolve => { finish = resolve; });
+  });
+  await started;
+  const expired = exclusive(() => assert.fail('expired work must never start'), { maxWaitMs: 60 });
+  const rejection = assert.rejects(expired, error => error.code === 'BUSY');
+  await new Promise(resolve => setTimeout(resolve, 40));
+  // Replace the first holder's file to model another process holding the lock after its turn.
+  await unlink(join(home, 'browser.lock'));
+  const release = await acquireLock(join(home, 'browser.lock'));
+  finish();
+  await first;
+  try { await rejection; }
+  finally { await release(); }
+  await pendingWork();
+});
+
+test('operation lock covers browser shutdown before the next task starts', { timeout: 2000 }, async t => {
+  let finishClose;
+  let entered;
+  const closing = new Promise(resolve => { entered = resolve; });
+  const { holdsLock } = await import('../server/lock.mjs');
+  t.mock.method(Browser, 'open', async () => ({
+    isLoggedIn: async () => false,
+    close: async () => {
+      assert.equal(holdsLock(join(home, 'browser.lock')), true);
+      entered();
+      await new Promise(resolve => { finishClose = resolve; });
+    },
+  }));
+  const first = status();
+  await closing;
+  let ran = false;
+  const next = exclusive(() => { ran = true; });
+  assert.equal(ran, false);
+  finishClose();
+  await Promise.all([first, next]);
+  assert.equal(ran, true);
 });

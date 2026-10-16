@@ -1,4 +1,5 @@
 import { mkdir, readdir, stat, unlink, open } from 'node:fs/promises';
+import { acquireLock } from './lock.mjs';
 import { randomUUID } from 'node:crypto';
 import { join, dirname, isAbsolute, extname } from 'node:path';
 import { Browser, findChrome, openPlainWindow } from './chrome.mjs';
@@ -11,9 +12,54 @@ import { parseArticleMarkdown, MAX_MARKDOWN_BYTES } from './markdown.mjs';
 import { createArticleDraft, setArticleCover, publishArticle, deleteArticleDraft } from './article.mjs';
 
 let queue = Promise.resolve();
-export function exclusive(fn) {
-  const result = queue.then(fn);
-  queue = result.catch(() => {});
+let queued = 0;
+let browserWaitOptions = {};
+
+// The CLI has one caller and a human waiting for the result.
+export function setBrowserWaitOptions(options) { browserWaitOptions = options; }
+
+export function exclusive(fn, { maxWaitMs = browserWaitOptions.maxWaitMs ?? config.busyWaitSec * 1000,
+  tool = 'browser', onStart, onWait = browserWaitOptions.onWait } = {}) {
+  const deadline = Date.now() + maxWaitMs;
+  const controller = new AbortController();
+  let started = false;
+  let notified = false;
+  const waiting = () => { if (!notified) { notified = true; onWait?.(); } };
+  let resolve;
+  let reject;
+  const result = new Promise((yes, no) => { resolve = yes; reject = no; });
+  const expire = () => {
+    if (started || controller.signal.aborted) return;
+    const error = new XPosterError('BUSY', 'x-poster 正在执行另一个浏览器任务，本次操作未执行。', {
+      retry_after_sec: 30,
+      hint: '本次操作没有执行，可以稍后安全重试；如果有文章任务在进行，请先用 x_article_status 等它完成。',
+    });
+    controller.abort(error);
+    reject(error);
+  };
+  const timer = setTimeout(expire, maxWaitMs);
+  if (queued++ > 0) waiting();
+  const slot = queue.then(async () => {
+    let release;
+    try {
+      if (controller.signal.aborted) return;
+      release = await acquireLock(join(config.home, 'browser.lock'), { tool, signal: controller.signal, onWait: waiting });
+      // Check the deadline as well as the timer, which may be delayed by a busy event loop.
+      if (Date.now() >= deadline) expire();
+      if (controller.signal.aborted) return;
+      started = true;
+      clearTimeout(timer);
+      onStart?.();
+      return await fn();
+    } finally {
+      clearTimeout(timer);
+      try { await release?.(); }
+      finally { queued--; }
+    }
+  });
+  // A cancelled slot remains in the chain until its predecessor finishes, then skips its work.
+  queue = slot.catch(() => {});
+  void slot.then(resolve, reject);
   return result;
 }
 
@@ -24,7 +70,7 @@ export async function waitForShutdown(work = pendingWork()) {
 }
 
 export function openBrowser(headless) {
-  return Browser.open({ profileDir: config.profileDir, executablePath: config.chromePath ?? findChrome(), headless });
+  return Browser.open({ profileDir: config.profileDir, executablePath: config.chromePath ?? findChrome(), headless, lockPath: join(config.home, 'browser.lock') });
 }
 
 let userWindowPromise = null;
@@ -38,7 +84,7 @@ async function checkLogin() {
 async function watchUserWindow(exited) {
   try {
     await exited;
-    return await exclusive(async () => ({ logged_in: await checkLogin(), reason: 'window_closed' }));
+    return await exclusive(async () => ({ logged_in: await checkLogin(), reason: 'window_closed' }), { maxWaitMs: browserWaitOptions.maxWaitMs ?? 15 * 60 * 1000, tool: 'login_check' });
   } catch {
     return { logged_in: false, reason: 'check_failed' };
   } finally {
@@ -61,7 +107,7 @@ export function openUserWindow() {
       profileDir: config.profileDir, executablePath, url: mode === 'login' ? URLS.login : URLS.home,
     });
     return { mode, done: watchUserWindow(exited) };
-  }).catch(error => {
+  }, { tool: 'x_login' }).catch(error => {
     userWindowPromise = null;
     throw error;
   });
@@ -111,7 +157,7 @@ export function status() {
       headless: config.headless,
       data_dir: config.home,
     } };
-  });
+  }, { tool: 'x_status' });
 }
 
 export async function login(args = {}) {
@@ -240,7 +286,7 @@ async function runCompose(args, mode) {
     } finally {
       await browser.close().catch(error => console.error('关闭浏览器失败：', error));
     }
-  });
+  }, { tool: `x_${mode}` });
 }
 
 export function preview(args) { return runCompose(args, 'preview'); }
@@ -263,7 +309,7 @@ export function listScheduled(args = {}) {
     } finally {
       await browser.close().catch(error => console.error('关闭浏览器失败：', error));
     }
-  });
+  }, { tool: 'x_list_scheduled' });
 }
 
 export function cancelScheduled(args) {
@@ -291,7 +337,7 @@ export function cancelScheduled(args) {
     } finally {
       await browser.close().catch(error => console.error('关闭浏览器失败：', error));
     }
-  });
+  }, { tool: 'x_cancel_scheduled' });
 }
 
 function articleIdInput(args, extraKeys = []) {
@@ -353,7 +399,7 @@ async function articleDraftInput(args) {
   return parseArticleMarkdown(source, { baseDir: dirname(args.markdown_path), title: args.title, cover: args.cover });
 }
 
-function runArticle(input, mode, onArticleId) {
+function runArticle(input, mode, onArticleId, waitOptions = {}) {
   return exclusive(async () => {
     requireUserWindowClosed();
     if (mode === 'publish') {
@@ -402,10 +448,10 @@ function runArticle(input, mode, onArticleId) {
       }
       return { data: { ok: true, ...result } };
     } finally { await browser.close().catch(error => console.error('关闭浏览器失败：', error)); }
-  });
+  }, { tool: `x_article_${mode}`, ...waitOptions });
 }
 
-// The CLI waits for the complete draft without a tool deadline.
+// The CLI waits for the complete draft without the MCP response deadline.
 export async function articleDraft(args) { return runArticle(await articleDraftInput(args), 'draft'); }
 export async function articleCover(args) { return runArticle(await articleCoverInput(args), 'cover'); }
 export async function articlePublish(args) { return runArticle({ articleId: articleIdInput(args) }, 'publish'); }
@@ -428,7 +474,7 @@ async function articleJobResult(job) {
     return { ...job.result, data: { ...job.result.data, job_id: job.id } };
   }
   return { data: {
-    ok: true, status: 'in_progress', job_id: job.id,
+    ok: true, status: 'in_progress', job_id: job.id, waiting_for_browser: job.waitingForBrowser,
     ...(job.articleId ? { article_id: job.articleId, edit_url: `https://x.com/compose/articles/edit/${job.articleId}` } : {}),
     elapsed_sec: Math.floor((Date.now() - job.startedAt) / 1000),
     next_step: `请使用 job_id ${job.id} 反复调用 x_article_status，直到返回最终结果。不要再次调用 x_article_draft，否则会创建重复草稿；遇到 UNCERTAIN 也不要重新创建，请检查 https://x.com/compose/articles。`,
@@ -437,10 +483,12 @@ async function articleJobResult(job) {
 
 async function startArticleJob(args) {
   const input = await articleDraftInput(args);
-  const job = { id: randomUUID(), startedAt: Date.now() };
+  const job = { id: randomUUID(), startedAt: Date.now(), waitingForBrowser: true };
   articleJobs.set(job.id, job);
   // Observe failures immediately so a timed-out client cannot cause an unhandled rejection.
-  job.done = runArticle(input, 'draft', id => { job.articleId = id; }).then(
+  job.done = runArticle(input, 'draft', id => { job.articleId = id; }, {
+    maxWaitMs: 15 * 60 * 1000, onStart: () => { job.waitingForBrowser = false; },
+  }).then(
     result => { job.result = result; },
     error => { job.error = error; },
   ).finally(() => { job.finishedAt = Date.now(); });

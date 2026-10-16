@@ -4,10 +4,11 @@ import { EventEmitter } from 'node:events';
 import { mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { acquireLock } from '../server/lock.mjs';
 import { config } from '../server/config.mjs';
 
 const previousExitListeners = new Set(process.listeners('exit'));
-const { Browser, chromeArgs } = await import('../server/chrome.mjs');
+const { Browser, chromeArgs, cleanupLaunch } = await import('../server/chrome.mjs');
 const [cleanupOnExit] = process.listeners('exit').filter(listener => !previousExitListeners.has(listener));
 
 const executablePath = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
@@ -15,6 +16,9 @@ const executablePath = '/Applications/Google Chrome.app/Contents/MacOS/Google Ch
 async function fixture(t) {
   const profileDir = await mkdtemp(join(tmpdir(), 'x-poster-background-'));
   t.after(() => rm(profileDir, { recursive: true, force: true }));
+  const lockPath = join(profileDir, 'browser.lock');
+  const release = await acquireLock(lockPath);
+  t.after(release);
   let time = 0;
   let alive = true;
   const calls = [];
@@ -62,8 +66,8 @@ async function fixture(t) {
       if (!alive) throw Object.assign(new Error('gone'), { code: 'ESRCH' });
     },
   };
-  const open = (options = {}) => Browser.open({ profileDir, executablePath, foreground: false, ...options }, runtime);
-  return { profileDir, child, calls, cdp, runtime, open, ready, setAlive: value => { alive = value; } };
+  const open = (options = {}) => Browser.open({ profileDir, executablePath, foreground: false, lockPath, ...options }, runtime);
+  return { profileDir, lockPath, release, child, calls, cdp, runtime, open, ready, setAlive: value => { alive = value; } };
 }
 
 test('chromeArgs can omit the startup URL', () => {
@@ -234,7 +238,7 @@ test('background launch polls DevToolsActivePort for exactly 20s without a real 
   assert.equal(f.calls.some(call => ['connect', 'kill'].includes(call[0])), false);
 });
 
-test('background launch failure closes CDP if neither PID source is available', async t => {
+test('background launch failure disconnects without closing an unproven browser', async t => {
   const f = await fixture(t);
   const send = f.cdp.send;
   f.cdp.send = async (...args) => {
@@ -242,7 +246,7 @@ test('background launch failure closes CDP if neither PID source is available', 
     return send(...args);
   };
   await assert.rejects(f.open(), error => error.code === 'BROWSER_LAUNCH_FAILED');
-  assert.ok(f.calls.some(call => call[0] === 'Browser.close'));
+  assert.equal(f.calls.some(call => call[0] === 'Browser.close'), false);
   assert.equal(f.calls.at(-1)[0], 'cdp.close');
   assert.equal(f.calls.some(call => call[0] === 'kill'), false);
 });
@@ -285,4 +289,73 @@ test('owned child shutdown retains the 10s SIGKILL fallback', async t => {
   t.mock.timers.tick(1);
   await closing;
   assert.deepEqual(f.calls.find(call => call[0] === 'child.kill'), ['child.kill', 'SIGKILL']);
+});
+
+test('pre-existing live SingletonLock is never killed or stripped of its endpoint', async t => {
+  const f = await fixture(t);
+  await symlink('host-123', join(f.profileDir, 'SingletonLock'));
+  await f.ready();
+  f.runtime.connect = async () => { throw new Error('not connectable'); };
+  await assert.rejects(f.open(), error => error.code === 'BROWSER_BUSY');
+  assert.equal(f.calls.some(call => ['spawn', 'execFile'].includes(call[0])), false);
+  assert.equal(f.calls.some(call => call[0] === 'kill' && call[2] !== 0), false);
+  const { readFile } = await import('node:fs/promises');
+  assert.match(await readFile(join(f.profileDir, 'DevToolsActivePort'), 'utf8'), /fake-id/);
+});
+
+test('launch rechecks profile liveness before unlinking the debugging endpoint', async t => {
+  const f = await fixture(t);
+  await symlink('host-123', join(f.profileDir, 'SingletonLock'));
+  await f.ready();
+  f.runtime.connect = async () => { throw new Error('not connectable'); };
+  let probes = 0;
+  f.runtime.kill = (pid, signal) => {
+    assert.equal(signal, 0, 'must never kill a pre-existing browser');
+    if (++probes === 1) throw Object.assign(new Error('gone'), { code: 'ESRCH' });
+  };
+  await assert.rejects(f.open(), error => error.code === 'BROWSER_BUSY');
+  assert.equal(f.calls.some(call => ['spawn', 'execFile'].includes(call[0])), false);
+  const { readFile } = await import('node:fs/promises');
+  assert.match(await readFile(join(f.profileDir, 'DevToolsActivePort'), 'utf8'), /fake-id/);
+});
+
+for (const previousAlive of [false, true]) {
+  test(`cleanup only claims a SingletonLock pid that was not alive before launch: ${previousAlive}`, async t => {
+    const f = await fixture(t);
+    await symlink('host-123', join(f.profileDir, 'SingletonLock'));
+    await cleanupLaunch({ cdp: f.cdp, profileDir: f.profileDir, previous: { pid: 123, alive: previousAlive },
+      lockPath: f.lockPath }, f.runtime);
+    assert.equal(f.calls.some(call => call[0] === 'kill' && call[2] === 'SIGKILL'), !previousAlive);
+    assert.equal(f.calls.some(call => call[0] === 'Browser.close'), !previousAlive);
+  });
+}
+
+for (const locked of [true, false]) {
+  test(`CDP-reported pid cleanup requires the operation lock: ${locked}`, async t => {
+    const f = await fixture(t);
+    if (!locked) await f.release();
+    await cleanupLaunch({ cdp: f.cdp, pid: 123, profileDir: f.profileDir, previous: { pid: 123, alive: true },
+      lockPath: f.lockPath }, f.runtime);
+    assert.equal(f.calls.some(call => call[0] === 'kill' && call[2] === 'SIGKILL'), locked);
+    assert.equal(f.calls.some(call => call[0] === 'Browser.close'), locked);
+    assert.equal(f.calls.at(-1)[0], 'cdp.close');
+  });
+}
+
+test('success fallback can own the same SingletonLock pid if it was dead before launch', async t => {
+  const f = await fixture(t);
+  await symlink('host-123', join(f.profileDir, 'SingletonLock'));
+  let launched = false;
+  const kill = f.runtime.kill;
+  f.runtime.kill = (pid, signal) => {
+    if (!launched && signal === 0) throw Object.assign(new Error('gone'), { code: 'ESRCH' });
+    return kill(pid, signal);
+  };
+  const execFile = f.runtime.execFile;
+  f.runtime.execFile = (...args) => { launched = true; execFile(...args); };
+  const send = f.cdp.send;
+  f.cdp.send = (...args) => args[0] === 'SystemInfo.getProcessInfo' ? Promise.resolve({}) : send(...args);
+  const browser = await f.open();
+  assert.equal(browser.pid, 123);
+  await browser.close();
 });
