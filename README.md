@@ -2,7 +2,7 @@
 
 让 Claude Code 和 Codex 通过本机 Chrome 在 X（Twitter）发布文字和最多 4 张本地图片。默认流程为**预览 → 用户明确确认 → 发布 → 返回链接**，用户提供的文字保持原样。支持使用 **X 自带的预排期** 定时发帖，由 X 服务器到时发布，电脑可以关机。
 
-插件运行一个零依赖的 Node.js ≥ 22 MCP stdio 服务器，名称为 `x-poster`，启动命令为 `node server/index.mjs`。服务器通过 Chrome DevTools Protocol（CDP）操作专用浏览器 profile，提供推文、预排期和 Markdown 长文章的十二个工具（见工具参考）。仓库根目录同时是两种宿主的插件根目录和市场根目录；两种宿主共用 `skills/x-poster/SKILL.md` 和默认数据目录 `~/.x-poster`，登录一次即可共用会话。
+插件运行一个零依赖的 Node.js ≥ 22 MCP stdio 服务器，名称为 `x-poster`，启动命令为 `node server/index.mjs`。服务器通过 Chrome DevTools Protocol（CDP）操作专用浏览器 profile，提供推文、串文、预排期和 Markdown 长文章的十六个工具（见工具参考）。仓库根目录同时是两种宿主的插件根目录和市场根目录；两种宿主共用 `skills/x-poster/SKILL.md` 和默认数据目录 `~/.x-poster`，登录一次即可共用会话。
 
 ## ⚠️ 风险
 
@@ -56,7 +56,7 @@ codex plugin add x-poster@x-poster
 
 仓库发布后，市场来源也可替换为 `<owner>/<repo>`。安装后重启 Codex。
 
-Codex 插件从 `.codex-mcp.json` 加载服务器配置。这里使用 `args: ["server/index.mjs"]` 和 `cwd: "."`，相对工作目录解析到安装后的插件根目录，不依赖 `${...}` 展开。`x_post`、`x_schedule`、`x_cancel_scheduled`、`x_article_publish` 和 `x_article_delete` 配置了 `approval_mode: "prompt"`，每次真实发布、创建或取消排期、发布或删除文章都要求宿主向用户请求审批；用户要求跳过预览时仍适用。
+Codex 插件从 `.codex-mcp.json` 加载服务器配置。这里使用 `args: ["server/index.mjs"]` 和 `cwd: "."`，相对工作目录解析到安装后的插件根目录，不依赖 `${...}` 展开。`x_post`、`x_schedule`、`x_thread_post`、`x_thread_schedule`、`x_cancel_scheduled`、`x_article_publish` 和 `x_article_delete` 配置了 `approval_mode: "prompt"`，每次真实发布、创建或取消排期、发布或删除文章都要求宿主向用户请求审批；用户要求跳过预览时仍适用。
 
 不使用插件时，可手动注册 MCP 服务器，并复制共享技能：
 
@@ -120,9 +120,57 @@ agent 先调用 `x_status`，必要时引导用户登录；准备文字和本地
 
 文字和图片至少需要一项；支持纯文字或纯图片。MCP 图片路径必须为绝对本地路径（支持 `~`），最多 4 张，URL 需先下载。支持 jpg、jpeg、png、webp、gif；图片每张最多 5 MB，GIF 最多 15 MB。CJK 字符和 emoji 按 2 计，链接按 23 计，非 Premium 账号限 280；预览返回加权长度及超限警告，最终是否接受由 X 决定。
 
+## 串文（Threads）
+
+支持三种模式：立即发布新串文、接在自己已有帖子后面、使用 X 原生预排期发布新串文。统一参数为 `posts: [{ text?, images? }, …]`，每条至少有文字或图片，最多 4 张图片，格式及大小与单帖相同。新串文需要 **2–25 条**；提供纯数字字符串 `in_reply_to` 时可接续 **1–25 条**。接续目标只能是当前登录用户自己的帖子，工具会核对回复对象与登录用户名；无法确认身份就停止。`in_reply_to` 不能与 `scheduled_at` 同用。
+
+先调用 `x_thread_preview`，向用户展示**全部截图、每一条的完整文字、图片和加权长度**，排期还要展示准确时间。超过 280 只警告，由 X 最终判断账号是否可发布。用户明确确认后，以**完全相同的参数**调用 `x_thread_post` 或 `x_thread_schedule`；修改任一条内容、目标或时间都应重新预览。接续预览先显示原帖与第一条回复，再在普通发帖框渲染全部内容；第二组截图仅用于预览，实际发布仍逐条回复。截图只截取发帖区域，视口最高 4000 px，只滚动发帖框内部；每次预览最多 8 张，接续时包括 1 张目标图和最多 7 张整串图。覆盖不完整时返回 `warnings`：串文较长，截图只覆盖前面部分，请在 X 中检查。请展示警告并检查完整内容后再确认。
+
+立即新串文使用“全部发帖”，确认所有 ID 后返回有序 `posted_ids`、`urls`、`count` 和首帖 `thread_url`。接续则每一步都回复上一条新帖，`thread_url` 指向原目标；某一步失败就立即停止，后续帖子不再提交。返回 `UNCERTAIN` 时必须展示 `posted_ids`，**不要重试，请用户检查主页上的串文是否完整**。客户端超时也不能当作未发布后重新调用。
+
+排期只支持新串文，`scheduled_at` 必填，时间规则与单帖相同，非零秒数向上取整到下一分钟。提交后核对 `CreateScheduledTweet` 请求中的帖子数量和每条文字；不一致时返回 `UNCERTAIN`，请用户检查排期列表，绝不自动取消。X 把整串显示为**一个排期条目**（列表文字是第一条），返回一个 `id`；先展示并确认这个条目，再用现有 `x_cancel_scheduled({ id })` 即可取消整串，取消不会退还已占用的本地额度。
+
+**每一条帖子都计入额度**：5 条串文消耗 5 条滚动 24 小时额度，即使 X 列表只显示一个排期条目。提交前整串检查剩余额度；不足返回 `RATE_LIMITED`，附 `posts_remaining`、`requested_count` 和等待秒数。默认每天最多 20 条，因此 21–25 条串文在默认额度下不能提交。最小间隔按整次操作计算，不会在一串内部逐条等待 60 秒。历史每串保存一条记录并带 `count`；不确定提交按可能已发出的条数保守计入，附已知 `posted_ids`。
+
+三个 MCP 串文工具均使用**进程内后台任务**，先完成输入校验，再通过 `exclusive` 和跨进程锁等待浏览器，最长排队 15 分钟。每次调用最多等待 `X_POSTER_TOOL_WAIT_SEC`（默认 45 秒）；及时完成时返回最终结果、全部图像及 `job_id`，未完成时返回 `ok: true`、`status: "in_progress"`、`job_id`、`waiting_for_browser`、`elapsed_sec` 和 `next_step`。
+
+拿到 `job_id` 后反复调用只读、幂等的 **`x_job_status({ job_id })`**，直到取得最终结果或原始错误；`x_article_status` 保留为兼容别名，文章和串文任务都可查询。**不要重新调用正在运行任务的创建工具，绝不要为这些帖子再次调用 `x_thread_post` 或 `x_thread_schedule`，否则会创建重复串文。** 预览也应查询已有任务，完成后展示全部截图再请用户确认。`UNCERTAIN` 仍须展示 `posted_ids` 并请用户检查主页或预排期列表，绝不重试。
+
+任务完成后保留 1 小时；进程重启或任务未知、过期后，应先到 X 核对，不能盲目重发。排队到期返回 `BUSY` 的任务不会稍后补执行。CLI 三个串文命令保持同步，始终等待最终结果，不返回 `in_progress` 或 `job_id`。
+
+CLI 用 `--file` 指定 JSON 或 Markdown；图片路径相对于**文件所在目录**解析，支持绝对路径和 `~/`。JSON 是帖子数组：
+
+```json
+[
+  { "text": "第一条\n第二行", "images": ["./one.png"] },
+  { "text": "第二条", "images": ["./two.jpg"] }
+]
+```
+
+Markdown 用仅含 `---` 的行分隔帖子，每条内的 `![](路径)` 提取为附件，其余内容保留为文字；含空格的图片路径可写 `![](<two image.png>)`：
+
+```markdown
+第一条正文
+![](one.png)
+---
+第二条正文
+![](two.jpg)
+```
+
+```bash
+node server/cli.mjs thread-preview --file ./thread.json
+# 展示并明确确认全部帖子后：
+node server/cli.mjs thread-post --file ./thread.json
+# 接续自己的帖子；预览确认后再用相同参数 thread-post：
+node server/cli.mjs thread-preview --file ./thread.md --reply-to 123456789
+# 将时间替换为至少 5 分钟后；确认后再用相同参数 thread-schedule：
+node server/cli.mjs thread-preview --file ./thread.md --at '2027-01-01T09:00+08:00'
+node server/cli.mjs thread-schedule --file ./thread.md --at '2027-01-01T09:00+08:00'
+```
+
 ## 工具参考
 
-共 12 个 MCP 工具。
+共 16 个 MCP 工具。
 
 | 工具 | 参数 | 行为与结果 |
 |---|---|---|
@@ -131,10 +179,14 @@ agent 先调用 `x_status`，必要时引导用户登录；准备文字和本地
 | `x_preview` | `text?`、`images?`、`scheduled_at?` | 填写发帖框，等待图片上传，保存并返回截图图像及路径，丢弃推文而不发布；返回 `weighted_length`，超过 280 时警告；带排期时间时预览排期并返回 `scheduled_at`（带偏移量）及 `scheduled_at_local`。 |
 | `x_post` | `text?`、`images?` | 真实发布，返回 `id` 和 `url`。 |
 | `x_schedule` | `text?`、`images?`、`scheduled_at`（必填） | 创建 X 原生预排期，返回 `scheduled: true`、`id`、`scheduled_at`、`scheduled_at_local`、`manage_url`。 |
+| `x_thread_preview` | `posts`、`in_reply_to?`、`scheduled_at?` | 后台任务；未完成时返回 `in_progress` 和 `job_id`；完成后返回 `job_id`、每条内容／图片／加权长度、数量、所有截图路径及 MCP 图像；接续另含回复对象、目标文字片段；排期另含准确时间。 |
+| `x_thread_post` | `posts`、`in_reply_to?` | 发布已预览确认的新串文或逐条接续自己的帖子；未完成时返回 `in_progress` 和 `job_id`；完成后返回 `job_id`、有序 `posted_ids`、`urls`、`count`、`thread_url`。 |
+| `x_thread_schedule` | `posts`、`scheduled_at` | 后台原生排期新串文；未完成时返回 `in_progress` 和 `job_id`；完成后返回 `job_id`、`ok`、`scheduled`、一个 `id`、`count`、准确时间及 `manage_url`。取消此 id 即取消整串。 |
 | `x_list_scheduled` | 无 | 返回按时间排序的 `scheduled` 和 `count`；每项含 `id`、`scheduled_at`、`text`、`media_count`、`state`（未知时为 `null`）。 |
 | `x_cancel_scheduled` | `id`（纯数字字符串） | 取消一个用户已明确确认的预排期帖；成功返回 `deleted: true`、`id` 和剩余数量 `remaining`，取消不计入发布额度。 |
 | `x_article_draft` | `markdown_path`（绝对路径）、`title?`、`cover?`（绝对路径） | 从 Markdown 新建文章草稿；长任务返回 `in_progress` 和 `job_id`，完成后返回 `job_id`、`article_id`、`edit_url`、标题、图片实际／预期数量、封面状态、字数文字、截图路径与图像、`warnings` 和 `next_step`；不会修改已有草稿。 |
-| `x_article_status` | `job_id`（UUID） | 只读、幂等查询草稿任务；返回最终结果及图像、原始错误或 `in_progress`，无需审批。 |
+| `x_job_status` | `job_id`（UUID） | 只读、幂等查询任意文章或串文任务；返回最终结果及全部图像、原始错误或 `in_progress`；完成后保留 1 小时，无需审批。 |
+| `x_article_status` | `job_id`（UUID） | `x_job_status` 的兼容别名，行为相同，也支持串文任务。 |
 | `x_article_cover` | `article_id`（纯数字字符串）、`cover`（绝对路径，支持 `~`） | 为用户指定的已有草稿添加或替换封面，返回 `article_id`、`edit_url`、`replaced`、`cover: true`、截图路径与图像；不发布、不修改正文、不写历史、不占发布额度。 |
 | `x_article_publish` | `article_id`（纯数字字符串） | 发布用户明确确认的这份草稿，返回 `article_id`，能确定链接时返回 `url`；计入发布限制。 |
 | `x_article_delete` | `article_id`（纯数字字符串） | 删除用户明确确认的草稿，核验删除响应和列表后返回 `deleted: true`；不计入发布限制。 |
@@ -147,7 +199,7 @@ agent 先调用 `x_status`，必要时引导用户登录；准备文字和本地
 
 X Articles 是 `https://x.com/compose/articles` 的长文章编辑器，需要**具备文章权限的 X Premium 账号**；没有新建入口时返回 `ARTICLES_UNAVAILABLE`。新文章采用 **新建草稿 → 用户审阅截图或 `edit_url` → 明确确认该 `article_id` → 发布**。草稿就是预览，不会公开；只要草稿时到此停止。不要把草稿截图当作发布成功。
 
-多图长文章可能超过客户端约 60 秒的超时。`x_article_draft` 默认等待 45 秒；未完成时返回 `ok: true`、`status: "in_progress"`、`job_id`、`elapsed_sec`、`next_step`，已知草稿 id 时还返回 `article_id` 和 `edit_url`。草稿任务等待浏览器时返回 `waiting_for_browser: true`，最多排队 15 分钟，开始执行后该字段变为 `false`；排队到期以 `BUSY` 结束任务。此时反复调用 `x_article_status({ job_id })`，直到得到最终结果及图像或错误。**任务进行中或收到 `UNCERTAIN` 后，绝不要为同一个文件再次调用 `x_article_draft`，否则会创建重复草稿。**
+多图长文章可能超过客户端约 60 秒的超时。`x_article_draft` 默认等待 45 秒；未完成时返回 `ok: true`、`status: "in_progress"`、`job_id`、`elapsed_sec`、`next_step`，已知草稿 id 时还返回 `article_id` 和 `edit_url`。草稿任务等待浏览器时返回 `waiting_for_browser: true`，最多排队 15 分钟，开始执行后该字段变为 `false`；排队到期以 `BUSY` 结束任务。此时反复调用 `x_job_status({ job_id })`，直到得到最终结果及图像或错误。**任务进行中或收到 `UNCERTAIN` 后，绝不要为同一个文件再次调用 `x_article_draft`，否则会创建重复草稿。**
 
 任务存储在当前服务器进程内，完成后保留 1 小时，后续工具调用时清理。任务未知或过期时先检查 https://x.com/compose/articles，不要盲目重建。客户端取消请求不会取消草稿工作；stdin 关闭或收到 SIGTERM / SIGINT 时，服务器默认等待正在执行或排队的工作最多 180 秒；第二次 SIGINT 立即退出。退出宽限到期或进程重启后不能继续轮询旧任务，需到 X 核对草稿。CLI 的 `article-draft` 始终等待最终结果，不输出 `in_progress`。
 
@@ -210,8 +262,8 @@ node server/cli.mjs article-cover --id '123' --cover ./cover.png
 | `X_POSTER_FOREGROUND` | `0` | 设为 `1`（也支持 `true`、`yes`、`on`）后直接启动 Chrome，让窗口来到前台；macOS 默认在后台运行。 |
 | `X_POSTER_MIN_INTERVAL_SEC` | `60` | 两次发布之间的最小秒数；`0` 关闭此限制。 |
 | `X_POSTER_DAILY_LIMIT` | `20` | 滚动 24 小时的最大发布数量；`0` 关闭此限制。 |
-| `X_POSTER_BUSY_WAIT_SEC` | `15` | 同步 MCP 调用等待浏览器空闲的最长秒数，限制在 1–120；无效值回退默认。包括进程内排队及跨进程文件锁等待；到期返回 `BUSY`，不会执行。后台文章任务最多等 15 分钟，CLI 最多等 10 分钟。 |
-| `X_POSTER_TOOL_WAIT_SEC` | `45` | MCP 草稿创建／状态查询单次等待秒数，限制在 5–300；无效值回退默认。应小于客户端工具超时。CLI 始终等待完成。 |
+| `X_POSTER_BUSY_WAIT_SEC` | `15` | 同步 MCP 调用等待浏览器空闲的最长秒数，限制在 1–120；无效值回退默认。包括进程内排队及跨进程文件锁等待；到期返回 `BUSY`，不会执行。后台文章及串文任务最多等 15 分钟，CLI 最多等 10 分钟。 |
+| `X_POSTER_TOOL_WAIT_SEC` | `45` | MCP 草稿创建、串文预览／发布／排期及任务状态查询单次等待秒数，限制在 5–300；无效值回退默认。应小于客户端工具超时。CLI 始终等待完成。 |
 | `X_POSTER_SHUTDOWN_GRACE_SEC` | `180` | stdin 关闭或 SIGTERM / SIGINT 后等待工作完成的最长秒数；`0` 立即退出。 |
 
 Claude Code 可通过启动 shell 设置变量，或合并到 `~/.claude/settings.json` 的 `env` 块：
@@ -251,6 +303,9 @@ CLI 等待浏览器空闲的期限为 10 分钟，等待时只向 stderr 提示�
 | `preview --text "…" [--image <path> …] [--at <ISO>]` | 预览，不发布；`--image` 可重复。 |
 | `post --text "…" [--image <path> …]` | 真实发布；`--image` 可重复。 |
 | `schedule --text "…" [--image <path> …] --at <ISO>` | 创建用户已预览确认的预排期；无偏移量时使用电脑本地时区。 |
+| `thread-preview --file <json或md> [--reply-to <id>] [--at <ISO>]` | 预览全部帖子；接续不能与排期同用。 |
+| `thread-post --file <json或md> [--reply-to <id>]` | 发布已预览确认的新串文或接续自己的帖子。 |
+| `thread-schedule --file <json或md> --at <ISO>` | 原生排期已预览确认的新串文。 |
 | `scheduled` | 列出预排期帖子。 |
 | `cancel --id <id>` | 取消一个预排期帖；先列出并向用户确认准确文字和时间。 |
 | `article-draft --file <md> [--title "…"] [--cover <img>]` | 新建文章草稿并截图；文件和封面允许相对路径。 |
@@ -278,7 +333,7 @@ node server/cli.mjs article-publish --id '<article_id>'
 node server/cli.mjs article-delete --id '<article_id>'
 ```
 
-CLI 会把 `--text` 中字面的 `\n` 转为换行，并允许相对图片路径；多图重复 `--image`。纯图片可省略 `--text`。CLI `post`、`schedule`、`cancel`、`article-publish`、`article-delete` 直接执行指定操作，没有 agent 的预览确认对话或 Codex 的工具审批，请在执行前核对内容和 id。新文章发布前必须先新建草稿并由用户确认；已有草稿可直接使用 `article-cover` 更换封面。
+CLI 会把 `--text` 中字面的 `\n` 转为换行，并允许相对图片路径；多图重复 `--image`。纯图片可省略 `--text`。CLI `post`、`schedule`、`thread-post`、`thread-schedule`、`cancel`、`article-publish`、`article-delete` 直接执行指定操作，没有 agent 的预览确认对话或 Codex 的工具审批，请在执行前核对内容和 id。新文章发布前必须先新建草稿并由用户确认；已有草稿可直接使用 `article-cover` 更换封面。
 
 ## 数据与安全
 
@@ -309,7 +364,7 @@ rm -rf ~/.x-poster/chrome-profile
 | `ARTICLES_UNAVAILABLE` | 当前账号没有文章新建入口；需要符合资格、具备文章权限的 X Premium 账号。 |
 | Google 提示“此浏览器或应用可能不安全” | Google 拒绝在启用了远程调试端口的浏览器中登录。按 Cmd+Q 完全退出占用专用 profile 的 Chrome（Windows/Linux 关闭它的所有窗口），再调用 `x_login` 使用普通登录窗口。 |
 | `NOT_LOGGED_IN` / 登录过期 | 调用 `x_login`，由用户重新登录并完全退出该 Chrome，再用 `x_status` 检查。 |
-| `BUSY` | **本次操作未执行，也不会稍后执行，可以稍后安全重试。** 如果有文章任务正在进行，先用 `x_article_status` 等它完成。`BUSY` 是唯一明确保证可安全重试的错误；`UNCERTAIN` 表示操作可能已经发生，绝不重试。 |
+| `BUSY` | **本次操作未执行，也不会稍后执行，可以稍后安全重试。** 如果有文章或串文任务正在进行，先用 `x_job_status` 等它完成。`BUSY` 是唯一明确保证可安全重试的错误；`UNCERTAIN` 表示操作可能已经发生，绝不重试。 |
 | `LOGIN_IN_PROGRESS` / `BROWSER_BUSY` | 请用户完成已有登录或检查操作，在该 Chrome 中按 Cmd+Q 完全退出（Windows/Linux 关闭它的所有窗口），再调用 `x_status`。仅关闭标签页可能仍占用专用 profile。 |
 | `ACCOUNT_CHALLENGE` | 调用 `x_login`，由用户在普通窗口中自行完成验证，然后完全退出该 Chrome；不要绕过 CAPTCHA。 |
 | `RATE_LIMITED` | 按 `retry_after_sec` 等待，不循环尝试。 |
@@ -348,6 +403,7 @@ claude plugin validate .
 │   ├── chrome.mjs              浏览器启动与 CDP
 │   ├── lock.mjs                跨进程浏览器任务锁及过期回收
 │   ├── x.mjs                   X 页面操作与 SELECTORS
+│   ├── thread.mjs              串文填充、截图、响应映射、接续及 CLI 文件解析
 │   ├── article.mjs             长文章草稿、发布、删除与 ARTICLE_SELECTORS
 │   ├── markdown.mjs            零依赖 Markdown 解析及本地图片校验
 │   ├── validate.mjs            输入校验与加权长度

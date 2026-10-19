@@ -11,6 +11,7 @@ export const URLS = {
 export const SELECTORS = {
   dialog: '[role=dialog]',
   editor: '[data-testid=tweetTextarea_0]',
+  addButton: '[data-testid=addButton]',
   fileInput: 'input[data-testid=fileInput]',
   postButton: '[data-testid=tweetButton]',
   scheduleButton: '[data-testid=scheduleOption]',
@@ -22,7 +23,7 @@ export const SELECTORS = {
   toast: '[data-testid=toast]',
   profileLink: '[data-testid=AppTabBar_Profile_Link]',
 };
-const CREATE_POST_URL = /\/i\/api\/graphql\/[^/]+\/Create(?:Tweet|Post|NoteTweet)\b/;
+export const CREATE_POST_URL = /\/i\/api\/graphql\/[^/]+\/(?:Create(?:Tweet|Post|NoteTweet)|NoteTweet)\b/;
 
 export function parseCreatePostResponse(body) {
   let json;
@@ -224,7 +225,7 @@ async function verifyText(page, selector, text) {
   }, [selector, text], { timeout: 2000 });
 }
 
-async function fillText(page, selector, text) {
+export async function fillText(page, selector, text) {
   const state = await page.call(editorState, selector);
   if (!state) throw new XPosterError('UI_CHANGED', '找不到发帖编辑器。', { selector });
   if (state.hasContent) await clearEditor(page, selector);
@@ -263,7 +264,7 @@ function textRejected(weightedLength, toast) {
   });
 }
 
-async function waitUntilReady(page, scope, images, weightedLength) {
+export async function waitUntilReady(page, scope, images, weightedLength, editorSelector) {
   const deadline = Date.now() + (images.length ? 120000 : 15000);
   let readyPolls = 0;
   let missingSince = null;
@@ -271,16 +272,26 @@ async function waitUntilReady(page, scope, images, weightedLength) {
   let snapshot;
   let settled = false;
   while (true) {
-    snapshot = await page.call((scope, selectors) => {
+    snapshot = await page.call((scope, selectors, editorSelector) => {
       const button = document.querySelector(scope + selectors.postButton);
-      const attachments = [...document.querySelectorAll(scope + selectors.attachments)];
+      let container = document;
+      if (editorSelector) {
+        container = document.querySelector(editorSelector)?.parentElement;
+        while (container && !container.querySelector(selectors.attachments)) {
+          const parent = container.parentElement;
+          if (!parent || [...parent.querySelectorAll('[data-testid^=tweetTextarea_]')]
+            .filter(element => /^tweetTextarea_\d+$/.test(element.getAttribute('data-testid'))).length !== 1) break;
+          container = parent;
+        }
+      }
+      const attachments = [...(container?.querySelectorAll(editorSelector ? selectors.attachments : scope + selectors.attachments) ?? [])];
       return {
         button: !button ? 'missing' : button.disabled || button.getAttribute('aria-disabled') === 'true' ? 'disabled' : 'enabled',
         hasAttachments: attachments.length > 0,
         uploading: attachments.some(el => el.querySelector('[role=progressbar]') || /uploading|processing|上传|处理/i.test(el.innerText)),
         toast: document.querySelector(selectors.toast)?.innerText || null,
       };
-    }, scope, SELECTORS);
+    }, scope, SELECTORS, editorSelector);
     const now = Date.now();
     settled = !snapshot.uploading && (!images.length || snapshot.hasAttachments);
     readyPolls = snapshot.button === 'enabled' && settled ? readyPolls + 1 : 0;
@@ -406,7 +417,7 @@ async function submitSchedule(page, selector) {
   }
 }
 
-async function setSchedule(page, scope, components) {
+export async function setSchedule(page, scope, components) {
   await page.click(scope + SELECTORS.scheduleButton);
   if (!await page.waitFor(selector => !!document.querySelector(selector), [SELECTORS.scheduleConfirm], { timeout: 10000 })) {
     throw new XPosterError('UI_CHANGED', '等待预排期对话框超时。', { selector: SELECTORS.scheduleConfirm });
@@ -593,29 +604,7 @@ export async function compose(browser, { text, images, submit, mode = submit ? '
   }
   const page = await browser.newPage();
   try {
-    await page.navigate(URLS.compose);
-    const state = await page.waitFor(selector => {
-      const path = location.pathname;
-      if (path.startsWith('/login') || path.startsWith('/i/flow/')) return 'login';
-      if (path.startsWith('/account/access')) return 'challenge';
-      return document.querySelector(selector) ? 'editor' : null;
-    }, [SELECTORS.editor], { timeout: 45000 });
-    if (state === 'login') {
-      throw new XPosterError('NOT_LOGGED_IN', 'X 登录状态已失效。', { hint: '请调用 x_login，让用户自己在 Chrome 窗口中登录。' });
-    }
-    if (state === 'challenge') {
-      throw new XPosterError('ACCOUNT_CHALLENGE', 'X 要求完成账号验证。', {
-        hint: '请调用 x_login 打开窗口，让用户完成验证；不要尝试绕过验证码。',
-      });
-    }
-    if (!state) {
-      throw new XPosterError('UI_CHANGED', '等待发帖编辑器超时。', {
-        selector: SELECTORS.editor, hint: '可能是网络较慢或 X 页面发生了变化，请查看 Chrome 窗口。',
-      });
-    }
-    const modal = await page.waitFor(selector => !!document.querySelector(selector),
-      [`${SELECTORS.dialog} ${SELECTORS.editor}`], { timeout: 8000 });
-    const scope = modal ? `${SELECTORS.dialog} ` : '';
+    const scope = await openComposer(page);
     if (text) await fillText(page, scope + SELECTORS.editor, text);
     if (images.length) await page.setFiles(scope + SELECTORS.fileInput, images);
     await waitUntilReady(page, scope, images, weightedLength);
@@ -646,4 +635,31 @@ export async function compose(browser, { text, images, submit, mode = submit ? '
     // Cleanup failures must not turn a confirmed post into a retryable failure.
     await page.close().catch(error => console.error('关闭发帖标签页失败：', error));
   }
+}
+
+export async function openComposer(page, url = URLS.compose) {
+  await page.navigate(url);
+  const state = await page.waitFor(selector => {
+    const path = location.pathname;
+    if (path.startsWith('/login') || path.startsWith('/i/flow/')) return 'login';
+    if (path.startsWith('/account/access')) return 'challenge';
+    return document.querySelector(selector) ? 'editor' : null;
+  }, [SELECTORS.editor], { timeout: 45000 });
+  if (state === 'login') {
+    throw new XPosterError('NOT_LOGGED_IN', 'X 登录状态已失效。', { hint: '请调用 x_login，让用户自己在 Chrome 窗口中登录。' });
+  }
+  if (state === 'challenge') {
+    throw new XPosterError('ACCOUNT_CHALLENGE', 'X 要求完成账号验证。', {
+      hint: '请调用 x_login 打开窗口，让用户完成验证；不要尝试绕过验证码。',
+    });
+  }
+  if (!state) {
+    throw new XPosterError('UI_CHANGED', '等待发帖编辑器超时。', {
+      selector: SELECTORS.editor, hint: '可能是网络较慢或 X 页面发生了变化，请查看 Chrome 窗口。',
+    });
+  }
+  const modal = await page.waitFor(selector => !!document.querySelector(selector),
+    [`${SELECTORS.dialog} ${SELECTORS.editor}`], { timeout: 8000 });
+  const scope = modal ? `${SELECTORS.dialog} ` : '';
+  return scope;
 }

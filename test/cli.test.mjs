@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -19,6 +19,10 @@ test('CLI help and invalid inputs never need Chrome', async t => {
   assert.match(help.stdout, /--at/);
   assert.match(help.stdout, /cancel/);
   assert.match(help.stdout, /--id/);
+  assert.match(help.stdout, /thread-preview/);
+  assert.match(help.stdout, /thread-post/);
+  assert.match(help.stdout, /thread-schedule/);
+  assert.match(help.stdout, /--reply-to/);
   assert.match(help.stdout, /article-draft/);
   assert.match(help.stdout, /article-cover/);
   assert.match(help.stdout, /article-publish/);
@@ -98,4 +102,50 @@ test('CLI stops waiting at ten simulated minutes with BUSY and never opens Chrom
   const error = JSON.parse(result.stderr.slice(result.stderr.indexOf('{')));
   assert.equal(error.code, 'BUSY');
   assert.match(error.hint, /安全重试/);
+});
+
+for (const command of ['thread-preview', 'thread-post', 'thread-schedule']) {
+  test(`CLI ${command} validates files and mode flags without Chrome`, { timeout: 4500 }, async t => {
+    const home = await mkdtemp(join(tmpdir(), 'x-poster-cli-thread-'));
+    t.after(() => rm(home, { recursive: true, force: true }));
+    const run = args => spawnSync(process.execPath,
+      [fileURLToPath(new URL('../server/cli.mjs', import.meta.url)), ...args],
+      { env: { ...process.env, X_POSTER_HOME: home, X_POSTER_CHROME_PATH: '/must-not-launch' }, encoding: 'utf8', timeout: 1500 });
+    for (const flags of [[], ['--file', './missing.json'], ['--file', './missing.md', '--text', 'no'],
+      ['--file', './missing.md', '--image', './x.png'], ['--file', './missing.md', '--title', 'no']]) {
+      const result = run([command, ...flags]);
+      assert.equal(result.status, 1, result.stderr);
+      assert.equal(JSON.parse(result.stderr).code, 'INVALID_INPUT');
+    }
+    const invalidFlag = run(['post', '--text', 'hello', '--reply-to', '123']);
+    assert.equal(JSON.parse(invalidFlag.stderr).code, 'INVALID_INPUT');
+  });
+}
+
+test('CLI routes JSON and Markdown threads through shared validation and limits using a fake browser', { timeout: 4500 }, async t => {
+  const home = await mkdtemp(join(tmpdir(), 'x-poster-cli-thread-files-'));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const image = join(home, 'one.png'); await writeFile(image, 'fixture');
+  const json = join(home, 'thread.json'); const md = join(home, 'thread.md');
+  await writeFile(json, JSON.stringify([{ text: 'first', images: ['./one.png'] }, { text: 'second' }]));
+  await writeFile(md, 'first\n![](one.png)\n---\nsecond');
+  const chromeURL = new URL('../server/chrome.mjs', import.meta.url).href;
+  const preload = `import { Browser } from ${JSON.stringify(chromeURL)};
+    Browser.open = async () => ({ isLoggedIn: async () => false, close: async () => {} });`;
+  const run = (command, file, flags = [], env = {}) => spawnSync(process.execPath,
+    ['--import', `data:text/javascript,${encodeURIComponent(preload)}`,
+      fileURLToPath(new URL('../server/cli.mjs', import.meta.url)), command, '--file', file, ...flags],
+    { env: { ...process.env, X_POSTER_HOME: home, X_POSTER_CHROME_PATH: '/must-not-launch', ...env }, encoding: 'utf8', timeout: 1500 });
+  for (const file of [json, md]) {
+    for (const [command, flags] of [['thread-preview', []], ['thread-post', []],
+      ['thread-schedule', ['--at', new Date(Date.now() + 86400000).toISOString()]]]) {
+      const result = run(command, file, flags);
+      assert.equal(JSON.parse(result.stderr).code, 'NOT_LOGGED_IN', result.stderr);
+    }
+  }
+  const limited = run('thread-post', json, [], { X_POSTER_DAILY_LIMIT: '1' });
+  const failure = JSON.parse(limited.stderr);
+  assert.equal(failure.code, 'RATE_LIMITED'); assert.equal(failure.requested_count, 2); assert.equal(failure.posts_remaining, 1);
+  const conflict = run('thread-preview', md, ['--reply-to', '123', '--at', new Date(Date.now() + 86400000).toISOString()]);
+  assert.equal(JSON.parse(conflict.stderr).code, 'INVALID_INPUT');
 });

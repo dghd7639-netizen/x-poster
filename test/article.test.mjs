@@ -1147,13 +1147,15 @@ test('cover image load timeout still returns a successful screenshot with a warn
 
 test('MCP preserves cover-image timeout warnings for cover updates and draft creation', async t => {
   const f = await toolFixture(t, { coverComplete: false });
+  // Exercise real lock I/O without charging it simulated browser time.
+  config.home = join(f.dir, ...Array.from({ length: 60 }, (_, i) => 'l' + i));
   const cover = join(f.dir, 'cover.png');
   await writeFile(cover, 'image');
   t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: Date.now() });
   for (const [tool, args] of [['x_article_cover', { article_id: '123', cover }],
     ['x_article_draft', { markdown_path: f.markdown_path, cover }]]) {
-    const result = await jobClock(t, callTool(tool, args));
-    assert.equal(result.isError, undefined);
+    const result = await jobClock(t, callTool(tool, args), { waitForLock: true });
+    assert.equal(result.isError, undefined, result.content[0].text);
     const data = JSON.parse(result.content[0].text);
     assert.equal(data.ok, true);
     assert.match(data.warning, /截图.*封面/);
@@ -1490,14 +1492,16 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
-async function jobClock(t, promise) {
+async function jobClock(t, promise, { waitForLock = false } = {}) {
   let outcome;
+  let browserStarted = !waitForLock;
   promise.then(value => { outcome = { value }; }, error => { outcome = { error }; });
   const deadline = performance.now() + 2000;
   while (!outcome) {
     await new Promise(resolve => setImmediate(resolve));
     assert.ok(performance.now() < deadline, 'job did not settle within 2 seconds');
-    if (!outcome) t.mock.timers.tick(250);
+    if (holdsLock(join(config.home, 'browser.lock'))) browserStarted = true;
+    if (!outcome && browserStarted) t.mock.timers.tick(250);
   }
   if (outcome.error) throw outcome.error;
   return outcome.value;
@@ -1548,6 +1552,7 @@ test('fast MCP draft returns its final shape, UUID and image, with idempotent st
   assert.deepEqual(data.warnings, []);
   assert.equal(result.content[1].type, 'image');
   assert.equal(result.content[1].data, Buffer.from('mock PNG').toString('base64'));
+  assert.deepEqual(await callTool('x_job_status', { job_id: data.job_id }), result);
   assert.deepEqual(await callTool('x_article_status', { job_id: data.job_id }), result);
   assert.deepEqual(await callTool('x_article_status', { job_id: data.job_id.toUpperCase() }), result);
   assert.equal(f.opened.mock.callCount(), 1);
@@ -1562,7 +1567,7 @@ test('slow draft exposes its id, repeated status waits, and later returns the fi
   assert.equal(f.data.article_id, '123');
   assert.equal(f.data.edit_url, 'https://x.com/compose/articles/edit/123');
   assert.equal(f.data.elapsed_sec, 45);
-  assert.match(f.data.next_step, /job_id.*x_article_status.*不要再次调用 x_article_draft.*重复草稿/);
+  assert.match(f.data.next_step, /job_id.*x_job_status.*不要再次调用 x_article_draft.*重复草稿/);
   assert.equal(f.progress.content.length, 1);
   const poll = callTool('x_article_status', { job_id: f.data.job_id });
   t.mock.timers.tick(45000);

@@ -3,14 +3,14 @@ name: x-poster
 description: >-
   通过本机 Chrome 预览、发布和预排期 X 推文，从 Markdown 创建、发布和删除 X 长文章草稿，并为已有草稿设置封面。
   用户说“发推”“发 X”“发推特”“把这段话/这张图发到 X”（包括“把这段话发到 X”“把这张图发到 X”）、
-  “post to X”“post on Twitter”“tweet this”“发布 X 文章”或“Markdown 转 X Article”时使用；提供推文、排期和文章的十二个 MCP 工具（12 个）。
+  “post to X”“post on Twitter”“tweet this”“发布 X 文章”“Markdown 转 X Article”“串文”“线程”“thread”“发一串”或“接在后面”时使用；提供推文、串文、排期和文章的十六个 MCP 工具（16 个）。
 ---
 
 # X 推文发布
 
 使用 MCP 服务器 `x-poster`，默认先预览、确认，再发布。
 
-`BUSY` 是唯一保证本次操作未执行、可稍后安全重试的错误；若有文章任务正在进行，先用 `x_article_status` 等它完成，`UNCERTAIN` 绝不重试。
+`BUSY` 是唯一保证本次操作未执行、可稍后安全重试的错误；若有文章或串文任务正在进行，先用 `x_job_status` 等它完成，`UNCERTAIN` 绝不重试。
 
 macOS 上自动化浏览器默认在后台运行，不抢焦点；需要查看时可点击 Chrome，或设置 `X_POSTER_FOREGROUND=1`，登录窗口仍在前台打开。
 
@@ -61,6 +61,24 @@ macOS 上自动化浏览器默认在后台运行，不抢焦点；需要查看�
 
 用户也可以直接在 X 网页“未发送的帖子 → 预排期”中取消。CLI 对应 `scheduled` 和 `cancel --id <id>`；先列出、展示准确文字与时间并确认，再执行取消。
 
+## 串文 / 线程 / thread
+
+触发词：串文、线程、thread、发一串、接在后面。支持立即新串文、接续自己的已有帖子、原生排期新串文。
+
+1. 检查登录和额度，准备有序 `posts: [{ text?, images? }, …]`。新串文 2–25 条；附 `in_reply_to` 时 1–25 条，必须是自己的帖子数字 id。每条至少有文字或图片，每条最多 4 张，格式和大小遵循单帖规则。每条单独报告加权长度，超过 280 只警告。
+2. `scheduled_at` 仅用于新串文；不能和 `in_reply_to` 同用，采用单帖的至少 5 分钟后、年份上限和分钟向上取整规则。
+3. 用完整参数调用 `x_thread_preview`，展示**所有截图及每条完整文字和图片**，排期还要展示准确时间，等待用户明确确认。接续先展示目标帖和第一条回复，再展示普通发帖框中渲染的整串；第二组截图仅用于预览，实际会逐条回复。工具核对“回复 @handle / Replying to @handle”与当前用户名，不是自己或无法确认就停止。截图仅覆盖发帖区域，单次最多 8 张（接续含 1 张目标图）。若返回 `warnings` 提示“串文较长，截图只覆盖前面部分，请在 X 中检查”，须展示警告并先检查完整内容，不能把截图当成整串均已覆盖。
+4. 用户明确确认后用**完全相同的 posts、in_reply_to、scheduled_at（如有）**调用 `x_thread_post` 或 `x_thread_schedule`。任意内容、目标或时间修改后重新预览确认。两个真实提交工具都遵循 Codex 每次工具审批。
+5. 立即发布回报有序 `posted_ids`、每条 `urls`、`count` 和 `thread_url`；接续的 `thread_url` 是原目标帖。排期回报整串共用的 `id`、`count`、准确时间和 `manage_url`。取消先展示并确认条目，再用 `x_cancel_scheduled` 取消这个 id，即取消整串，绝不自动取消。
+6. 每条都占本地额度，5 条串文计 5；最小间隔按一次操作计算。默认 20 条/24 小时会拒绝 21–25 条串文。`RATE_LIMITED` 展示剩余 `posts_remaining`、需要的 `requested_count` 和等待时间，不擅自提高额度。不确定提交也按可能发出的条数记录。
+7. `UNCERTAIN` 必须展示已知 `posted_ids`，**不要重试，请用户检查主页上的串文是否完整**；排期则检查预排期列表。接续任何一步出错后都停止，不能自行继续补发。
+
+三个 MCP 串文工具都使用后台任务：先校验输入，再排队等待浏览器，最多 15 分钟；单次最多等待 `X_POSTER_TOOL_WAIT_SEC`（默认 45 秒）。及时完成就返回最终结果、全部图像和 `job_id`；否则返回 `in_progress`、`job_id`、`waiting_for_browser`、`elapsed_sec` 和 `next_step`。此时反复调用只读、幂等的 `x_job_status({ job_id })`，直到最终结果或原始错误，**不要重新调用任务的创建工具，绝不要为这些帖子再次调用 `x_thread_post` / `x_thread_schedule`，否则会创建重复串文**。预览同样轮询已有任务，取得全部截图后再展示确认。
+
+`x_article_status` 是 `x_job_status` 的兼容别名，文章和串文都可查询。完成任务保留 1 小时；服务器重启或任务未知、过期时先请用户核查 X，不能盲目重发。`UNCERTAIN` 展示 `posted_ids` 并检查主页或预排期列表；`BUSY` 保证未执行，也不会随后补执行。CLI 保持同步等待最终结果，不返回后台任务。
+
+CLI：`thread-preview --file <json或md> [--reply-to <id>] [--at <ISO>]`、`thread-post --file <json或md> [--reply-to <id>]`、`thread-schedule --file <json或md> --at <ISO>`。JSON 为帖子数组；Markdown 用单独一行 `---` 分隔帖子，`![](path)` 为该条图片。相对图片路径按文件目录解析。CLI 也须先预览全部内容并确认再真实提交。
+
 ## 文章（X Articles）
 
 `x_article_cover`、`x_article_publish` 和 `x_article_delete` 仅适用于草稿。
@@ -71,7 +89,7 @@ macOS 上自动化浏览器默认在后台运行，不抢焦点；需要查看�
 
 1. 获取本地 `.md` 文件路径。用户只给文字时，先将文字写入 `.md` 文件，保留用户内容。MCP `markdown_path` 必须是绝对路径，最多 1 MB；标题来自参数 `title`、front matter `title:` 或首个 `# `（优先级从高到低），正文不能为空。
 2. 调用 `x_article_draft({ markdown_path, title?, cover? })`，每次都会**新建**草稿，永不编辑已有草稿。正文图片使用相对于 Markdown 目录的本地路径，最多 50 张、每组最多 4 张；远程图片不下载，会跳过并警告。格式及大小遵循推文图片规则。可选封面通过 front matter `cover:` 或绝对路径参数 `cover` 提供，参数优先；仅支持 jpg/jpeg/png/webp，最多 5 MB。
-3. 长文章可能返回 `status: "in_progress"` 和 `job_id`；此时反复调用只读、幂等的 `x_article_status({ job_id })`，无需审批，直到获得最终结果或错误。已知草稿 id 时会同时返回 `article_id` 和 `edit_url`。任务进行中或收到 `UNCERTAIN` 后，绝不要为同一个文件再次调用 `x_article_draft`，否则会创建重复草稿。完成的任务保留 1 小时；服务器重启、任务未知或过期时，先检查 https://x.com/compose/articles，不要盲目重建。
+3. 长文章可能返回 `status: "in_progress"` 和 `job_id`；此时反复调用只读、幂等的 `x_job_status({ job_id })`，无需审批，直到获得最终结果或错误。已知草稿 id 时会同时返回 `article_id` 和 `edit_url`。任务进行中或收到 `UNCERTAIN` 后，绝不要为同一个文件再次调用 `x_article_draft`，否则会创建重复草稿。完成的任务保留 1 小时；服务器重启、任务未知或过期时，先检查 https://x.com/compose/articles，不要盲目重建。
 4. 展示返回的**截图、标题、所有 warnings、article_id 和 edit_url**。用户也可打开 `edit_url` 完整审阅；截图只覆盖当前视口。`##` 映射为文章“标题”，`###`–`######` 为“副标题”；嵌套列表展平，代码块和表格降级为普通段落，分割线跳过，原始 HTML 按文字处理。
 5. 询问用户是否发布**这一份草稿**，等待明确确认。用户选择“只要草稿”时立即结束。文章始终先创建草稿作为预览，即使用户提出直接发布，也需先展示并确认这个 id。
 6. 确认后调用 `x_article_publish({ article_id })`，回报返回的 id 和链接（如有）。该操作公开文章，计入与推文共用的发布额度，还需遵循 Codex 每次工具审批。
@@ -106,7 +124,7 @@ CLI 对应 `article-draft --file <md> [--title …] [--cover <img>]`、`article-
 ## 规则
 
 - 只发布用户明确确认的内容；推文在本次明确要求直接发布时视为授权该次内容，文章始终先创建草稿并明确确认这个 id。
-- 不批量发帖、不发垃圾内容、不重复发布相同推文。
+- 串文只发布这次明确确认的有序内容；不发垃圾内容、不重复发布相同推文。
 - 遇到 `UNCERTAIN` 永不重试，即使暂时未找到推文，也交由用户核查。
 - 绝不绕过 CAPTCHA 或账号验证。
 - 绝不处理密码：不询问、不输入、不存储。

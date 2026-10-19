@@ -483,7 +483,7 @@ function scheduledPage(t, { failHistory = false } = {}) {
       if (args.length === 1 && args[0] === '[role=dialog]') {
         return values.map((options, i) => ({ value: selected[i] ?? '', options: options.map(value => ({ value, text: value })) }));
       }
-      if (args.length === 2 && typeof args[1] === 'object') return { button: 'enabled', hasAttachments: true, uploading: false };
+      if (args[1]?.postButton === '[data-testid=tweetButton]') return { button: 'enabled', hasAttachments: true, uploading: false };
       if (args[0] === '[data-testid=AppTabBar_Profile_Link]') return 'alice';
       return null;
     },
@@ -597,7 +597,7 @@ test('expired queue slots never execute and later calls retain their order', { t
     await assert.rejects(expired, error => {
       assert.equal(error.code, 'BUSY');
       assert.equal(error.toJSON().retry_after_sec, 30);
-      assert.match(error.hint, /没有执行.*安全重试.*x_article_status/);
+      assert.match(error.hint, /没有执行.*安全重试.*x_job_status/);
       return true;
     });
   } finally { release(); }

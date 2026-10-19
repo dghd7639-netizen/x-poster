@@ -2,8 +2,9 @@
 import { parseArgs } from 'node:util';
 import { resolve } from 'node:path';
 import { expandHome } from './config.mjs';
+import { readThreadFile } from './thread.mjs';
 import { XPosterError } from './errors.mjs';
-import { setBrowserWaitOptions, status, preview, post, schedule, listScheduled, cancelScheduled, openUserWindow, articleDraft, articleCover, articlePublish, articleDelete } from './tools.mjs';
+import { setBrowserWaitOptions, status, preview, post, schedule, listScheduled, cancelScheduled, openUserWindow, articleDraft, articleCover, articlePublish, articleDelete, threadPreview, threadPost, threadSchedule } from './tools.mjs';
 
 const usage = `x-poster 命令行（需要 Node.js 22 或更高版本）
 
@@ -16,6 +17,9 @@ const usage = `x-poster 命令行（需要 Node.js 22 或更高版本）
   preview  填写并截图预览，不发布
   post     发布已经由用户确认的文字和图片
   schedule 创建已经由用户预览确认的 X 原生预排期
+  thread-preview  从 JSON / Markdown 文件预览整串帖子或接续
+  thread-post     发布已明确确认的新串文或接续串文
+  thread-schedule 创建已明确确认的新串文原生预排期
   scheduled 查看预排期帖子列表
   cancel   按 id 取消已经由用户确认的一个预排期帖子
   article-draft   从 Markdown 新建 X 文章草稿并截图，需符合资格的 Premium 账号
@@ -28,7 +32,8 @@ const usage = `x-poster 命令行（需要 Node.js 22 或更高版本）
   --image <路径>    可重复使用，最多 4 张；支持绝对路径、相对路径和 ~
   --at <ISO>       预排期时间；无偏移量时使用电脑本地时区，至少 5 分钟后
   --id <数字>      cancel 的排期 id 或 article-cover / article-publish / article-delete 的文章 id
-  --file <路径>    article-draft 的 .md 文件，最多 1 MB；支持相对路径
+  --file <路径>    串文 .json / .md 文件，或 article-draft 的 .md 文件；支持相对路径
+  --reply-to <id>  串文接在自己的目标帖子后面；不能与 --at 同用
   --title <标题>   article-draft 的可选标题，覆盖 Markdown 标题
   --cover <路径>   article-cover 的本地封面，或 article-draft 的可选封面；支持相对路径
   -h, --help        显示帮助
@@ -54,7 +59,7 @@ async function main() {
       allowPositionals: true,
       options: {
         id: { type: 'string' }, at: { type: 'string' }, text: { type: 'string' }, image: { type: 'string', multiple: true },
-        file: { type: 'string' }, title: { type: 'string' }, cover: { type: 'string' },
+        'reply-to': { type: 'string' }, file: { type: 'string' }, title: { type: 'string' }, cover: { type: 'string' },
         help: { type: 'boolean', short: 'h' },
       },
     }));
@@ -65,14 +70,20 @@ async function main() {
   }
   if (positionals.length !== 1) throw new XPosterError('INVALID_INPUT', '请只指定一个命令。');
   const [command] = positionals;
-  if (values.at !== undefined && !['preview', 'schedule'].includes(command)) {
-    throw new XPosterError('INVALID_INPUT', '--at 仅用于 preview 或 schedule。');
+  if (values.at !== undefined && !['preview', 'schedule', 'thread-preview', 'thread-schedule'].includes(command)) {
+    throw new XPosterError('INVALID_INPUT', '--at 仅用于 preview、schedule、thread-preview 或 thread-schedule。');
   }
   if (values.id !== undefined && !['cancel', 'article-cover', 'article-publish', 'article-delete'].includes(command)) {
     throw new XPosterError('INVALID_INPUT', '--id 仅用于 cancel、article-cover、article-publish 或 article-delete。');
   }
-  if (['file', 'title'].some(key => values[key] !== undefined) && command !== 'article-draft') {
-    throw new XPosterError('INVALID_INPUT', '--file 和 --title 仅用于 article-draft。');
+  const isThread = ['thread-preview', 'thread-post', 'thread-schedule'].includes(command);
+  if (values.file !== undefined && command !== 'article-draft' && !isThread
+    || values.title !== undefined && command !== 'article-draft') {
+    throw new XPosterError('INVALID_INPUT', '--file 仅用于串文或 article-draft；--title 仅用于 article-draft。');
+  }
+  if (values['reply-to'] !== undefined && !isThread) throw new XPosterError('INVALID_INPUT', '--reply-to 仅用于串文。');
+  if (isThread && (values.text !== undefined || values.image !== undefined || !values.file)) {
+    throw new XPosterError('INVALID_INPUT', '串文请使用 --file，不接受 --text / --image。');
   }
   if (values.cover !== undefined && !['article-draft', 'article-cover'].includes(command)) {
     throw new XPosterError('INVALID_INPUT', '--cover 仅用于 article-draft 或 article-cover。');
@@ -85,6 +96,10 @@ async function main() {
     ...(values.at !== undefined ? { scheduled_at: values.at } : {}),
     images: (values.image ?? []).map(path => resolve(expandHome(path))),
   };
+  const threadInput = isThread ? { posts: await readThreadFile(values.file),
+    ...(values['reply-to'] !== undefined ? { in_reply_to: values['reply-to'] } : {}),
+    ...(values.at !== undefined ? { scheduled_at: values.at } : {}),
+  } : null;
   let waitingPrinted = false;
   setBrowserWaitOptions({ maxWaitMs: 10 * 60 * 1000, onWait: () => {
     if (waitingPrinted) return;
@@ -108,6 +123,9 @@ async function main() {
       print(await done);
       return 0;
     }
+    case 'thread-preview': print((await threadPreview(threadInput)).data); return 0;
+    case 'thread-post': print((await threadPost(threadInput)).data); return 0;
+    case 'thread-schedule': print((await threadSchedule(threadInput)).data); return 0;
     case 'preview': print((await preview(input)).data); return 0;
     case 'schedule': print((await schedule(input)).data); return 0;
     case 'cancel': print((await cancelScheduled({ id: values.id })).data); return 0;

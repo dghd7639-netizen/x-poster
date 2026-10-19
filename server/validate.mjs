@@ -103,3 +103,33 @@ export function parseScheduledAt(value, now = new Date()) {
     year: date.getFullYear(), month: date.getMonth() + 1, day: date.getDate(), hour: date.getHours(), minute: date.getMinutes(),
   } };
 }
+
+export async function validateThreadInput(input, mode = 'preview') {
+  if (!input || typeof input !== 'object' || Array.isArray(input)
+    || Object.keys(input).some(key => !['posts', 'in_reply_to', 'scheduled_at'].includes(key))) {
+    throw new XPosterError('INVALID_INPUT', '串文参数必须是包含 posts 的对象。');
+  }
+  const reply = input.in_reply_to;
+  if (reply !== undefined && (typeof reply !== 'string' || !reply || /\D/.test(reply))) {
+    throw new XPosterError('INVALID_INPUT', 'in_reply_to 必须是帖子的纯数字字符串。');
+  }
+  const hasSchedule = Object.hasOwn(input, 'scheduled_at');
+  if (reply !== undefined && hasSchedule) throw new XPosterError('INVALID_INPUT', '接续串文不支持预排期。');
+  if (mode === 'post' && hasSchedule) throw new XPosterError('INVALID_INPUT', '带 scheduled_at 的串文请使用 x_thread_schedule。');
+  if (mode === 'schedule' && reply !== undefined) throw new XPosterError('INVALID_INPUT', '只能预排期新串文。');
+  let scheduled = hasSchedule || mode === 'schedule' ? parseScheduledAt(input.scheduled_at) : null;
+  if (scheduled) scheduled = parseScheduledAt(new Date(Math.ceil(scheduled.date.getTime() / 60000) * 60000).toISOString());
+  const minimum = reply === undefined ? 2 : 1;
+  if (!Array.isArray(input.posts) || input.posts.length < minimum || input.posts.length > 25) {
+    throw new XPosterError('INVALID_INPUT', `串文需要 ${minimum} 到 25 条帖子。`);
+  }
+  const posts = [];
+  for (const post of input.posts) {
+    if (!post || typeof post !== 'object' || Array.isArray(post)
+      || Object.keys(post).some(key => !['text', 'images'].includes(key))) {
+      throw new XPosterError('INVALID_INPUT', '每条帖子必须是包含 text 或 images 的对象。');
+    }
+    posts.push(await validatePostInput(post));
+  }
+  return { posts, inReplyTo: reply, scheduled };
+}

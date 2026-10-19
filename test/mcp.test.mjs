@@ -52,11 +52,26 @@ test('MCP handshake, listing, validation and clean stdin shutdown', { timeout: 5
   child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: 'ignored-cancel', method: 'notifications/cancelled' })}\n`);
   child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: 'no-method' })}\n`);
   const list = await request('tools/list');
-  assert.deepEqual(list.result.tools.map(tool => tool.name), ['x_status', 'x_login', 'x_preview', 'x_post', 'x_schedule', 'x_list_scheduled', 'x_cancel_scheduled', 'x_article_draft', 'x_article_status', 'x_article_cover', 'x_article_publish', 'x_article_delete']);
-  assert.equal(list.result.tools.length, 12);
-  assert.match(init.result.instructions, /12 tools/);
-  assert.match(init.result.instructions, /in_progress.*job_id.*x_article_status.*Never call x_article_draft again.*UNCERTAIN/);
+  assert.deepEqual(list.result.tools.map(tool => tool.name), ['x_status', 'x_login', 'x_preview', 'x_post', 'x_schedule', 'x_thread_preview', 'x_thread_post', 'x_thread_schedule', 'x_list_scheduled', 'x_cancel_scheduled', 'x_article_draft', 'x_job_status', 'x_article_status', 'x_article_cover', 'x_article_publish', 'x_article_delete']);
+  assert.equal(list.result.tools.length, 16);
+  assert.match(init.result.instructions, /16 tools/);
+  assert.match(init.result.instructions, /in_progress.*job_id.*x_job_status.*Never call x_article_draft again.*UNCERTAIN/);
+  for (const name of ['x_thread_preview', 'x_thread_post', 'x_thread_schedule']) {
+    const tool = list.result.tools.find(tool => tool.name === name);
+    assert.equal(tool.annotations.readOnlyHint, false);
+    assert.equal(tool.annotations.idempotentHint, name === 'x_thread_preview');
+    assert.equal(tool.annotations.destructiveHint, false);
+    assert.ok(tool.inputSchema.required.includes('posts'));
+    assert.match(tool.description, /explicit confirmation/);
+    const invalid = await request('tools/call', { name, arguments: { posts: [{ text: 'one' }] } });
+    assert.equal(JSON.parse(invalid.result.content[0].text).code, 'INVALID_INPUT');
+  }
+  assert.match(init.result.instructions, /x_thread_preview.*every post.*identical arguments.*posted_ids/);
   const articleStatus = list.result.tools.find(tool => tool.name === 'x_article_status');
+  const jobStatus = list.result.tools.find(tool => tool.name === 'x_job_status');
+  assert.deepEqual(jobStatus.annotations, articleStatus.annotations);
+  assert.deepEqual(jobStatus.inputSchema, articleStatus.inputSchema);
+  assert.match(articleStatus.description, /alias of x_job_status/);
   assert.deepEqual(articleStatus.annotations, { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false });
   assert.deepEqual(articleStatus.inputSchema.required, ['job_id']);
   assert.equal(new RegExp(articleStatus.inputSchema.properties.job_id.pattern).test('123'), false);

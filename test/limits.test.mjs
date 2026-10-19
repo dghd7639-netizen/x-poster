@@ -62,3 +62,22 @@ test('article publications count while draft deletions never consume limits or e
   assert.equal(check([{ ts: entry(10).ts, article_id: '456', uncertain: true }]).retryAfterSec, 50);
   assert.equal(check([...Array(20).fill(published), ...deletions]).allowed, false);
 });
+
+test('thread counts sum with legacy singles and uncertain history', () => {
+  const history = [entry(500), { ...entry(400), count: 5, ids: ['1', '2', '3', '4', '5'] },
+    { ts: entry(300).ts, count: 3, uncertain: true, posted_ids: ['6'] }];
+  assert.equal(check(history).postsLast24h, 9);
+  assert.equal(check(history, { count: 12 }).allowed, false);
+  assert.equal(check(history, { count: 11 }).allowed, true);
+  assert.equal(check([{ ...entry(10), count: 5 }], { count: 3 }).retryAfterSec, 50);
+  assert.equal(check([{ ...entry(90000), count: 25 }]).postsLast24h, 0);
+});
+
+test('weighted daily limit waits until enough whole operations expire', () => {
+  const history = [{ ...entry(80000), count: 2 }, { ...entry(70000), count: 4 }, { ...entry(60000), count: 3 }];
+  const rate = check(history, { dailyLimit: 10, count: 5 });
+  assert.equal(rate.allowed, false); assert.equal(rate.postsLast24h, 9);
+  assert.equal(rate.retryAfterSec, 86400 - 70000);
+  assert.equal(check(history, { dailyLimit: 0, minIntervalSec: 0, count: 25 }).allowed, true);
+  assert.equal(check([], { dailyLimit: 20, count: 25 }).allowed, false);
+});
