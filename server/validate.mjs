@@ -124,12 +124,19 @@ export async function validateThreadInput(input, mode = 'preview') {
     throw new XPosterError('INVALID_INPUT', `串文需要 ${minimum} 到 25 条帖子。`);
   }
   const posts = [];
-  for (const post of input.posts) {
-    if (!post || typeof post !== 'object' || Array.isArray(post)
-      || Object.keys(post).some(key => !['text', 'images'].includes(key))) {
-      throw new XPosterError('INVALID_INPUT', '每条帖子必须是包含 text 或 images 的对象。');
+  for (const [index, post] of input.posts.entries()) {
+    try {
+      if (!post || typeof post !== 'object' || Array.isArray(post)
+        || Object.keys(post).some(key => !['text', 'images'].includes(key))) {
+        throw new XPosterError('INVALID_INPUT', '每条帖子必须是包含 text 或 images 的对象。');
+      }
+      posts.push(await validatePostInput(post));
+    } catch (error) {
+      if (!(error instanceof XPosterError) || error.code !== 'INVALID_INPUT') throw error;
+      throw new XPosterError(error.code, `第 ${index + 1} 条帖子：${error.message}`, {
+        ...error.details, hint: error.hint, post_index: index + 1,
+      });
     }
-    posts.push(await validatePostInput(post));
   }
   return { posts, inReplyTo: reply, scheduled };
 }

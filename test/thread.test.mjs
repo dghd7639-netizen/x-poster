@@ -11,7 +11,7 @@ import { XPosterError } from '../server/errors.mjs';
 const home = await mkdtemp(join(tmpdir(), 'x-poster-thread-'));
 process.env.X_POSTER_HOME = home;
 process.env.X_POSTER_CHROME_PATH = '/fake/chrome';
-const { validateThreadInput } = await import('../server/validate.mjs');
+const { validateThreadInput, validatePostInput } = await import('../server/validate.mjs');
 const { composeThread, fillThread, captureThread, checkOwnReply, mapThreadResponses, verifyScheduledThread,
   watchThreadResponses, readThreadFile } = await import('../server/thread.mjs');
 const { config, saveState } = await import('../server/config.mjs');
@@ -234,6 +234,37 @@ test('thread validates counts, each item, image rules and modes before Browser.o
   for (const count of [2, 25]) assert.equal((await validateThreadInput({ posts: Array(count).fill({ text: 'x' }) })).posts.length, count);
   for (const count of [1, 25]) assert.equal((await validateThreadInput({ posts: Array(count).fill({ text: 'x' }), in_reply_to: '123' })).posts.length, count);
   assert.equal(opened.mock.callCount(), 0);
+});
+
+test('thread post errors include their position and preserve image error details', async () => {
+  await assert.rejects(validateThreadInput({ posts: [{ text: 'first' }, { text: 'second' }, {}] }), error => {
+    assert.ok(error instanceof XPosterError);
+    assert.equal(error.code, 'INVALID_INPUT');
+    assert.equal(error.message, '第 3 条帖子：请至少提供文字或一张图片。');
+    assert.deepEqual(error.details, { post_index: 3 });
+    return true;
+  });
+  for (const post of [null, [], 'bad', { unexpected: true }]) {
+    await assert.rejects(validateThreadInput({ posts: [{ text: 'first' }, post] }), error => {
+      assert.equal(error.code, 'INVALID_INPUT');
+      assert.equal(error.message, '第 2 条帖子：每条帖子必须是包含 text 或 images 的对象。');
+      assert.deepEqual(error.details, { post_index: 2 });
+      return true;
+    });
+  }
+  for (const images of [['relative.png'], [join(home, 'missing-post-image.png')]]) {
+    let original;
+    try { await validatePostInput({ images }); } catch (error) { original = error; }
+    assert.ok(original instanceof XPosterError);
+    await assert.rejects(validateThreadInput({ posts: [{ text: 'first' }, { images }] }), error => {
+      assert.equal(error.code, original.code);
+      assert.equal(error.message, `第 2 条帖子：${original.message}`);
+      assert.equal(error.hint, original.hint);
+      assert.deepEqual(error.details, { ...original.details, post_index: 2 });
+      assert.equal(error.toJSON().post_index, 2);
+      return true;
+    });
+  }
 });
 
 test('fill clicks add N-1 times, pastes each editor, and focuses before each shared file input', { timeout: 4500 }, async () => {
@@ -605,6 +636,79 @@ test('CLI thread JSON and Markdown resolve local images relative to file and pre
   for (const source of ['{}', 'null', '[1]', '[{"images":"bad"}]', '[{"images":[null]}]']) {
     await writeFile(json, source); await assert.rejects(readThreadFile(json), error => error.code === 'INVALID_INPUT');
   }
+});
+
+test('Markdown threads ignore empty edges and leading front matter only', async () => {
+  const md = join(home, 'edges.md');
+  for (const source of [
+    'first post\n\n---\n\nsecond post\n\n---\n',
+    '---\n\nfirst post\n\n---\n\nsecond post\n',
+    '\n---\n \n---\nfirst post\n---\nsecond post\n---\n\n---\n',
+    '---\ntitle: x\n\nauthor: y\n---\n\nfirst post\n---\nsecond post\n',
+  ]) {
+    await writeFile(md, source);
+    assert.deepEqual(await readThreadFile(md), [
+      { text: 'first post', images: [] }, { text: 'second post', images: [] },
+    ], source);
+  }
+  for (const [source, texts] of [
+    ['---\nreal post\n---\nsecond post', ['real post', 'second post']],
+    ['---\ntitle: x\nreal post\n---\nsecond', ['title: x\nreal post', 'second']],
+    ['---\ntitle: real post', ['title: real post']],
+    ['\n---\ntitle: real post\n---\nsecond', ['title: real post', 'second']],
+    ['--- \ntitle: real post\n---\nsecond', ['title: real post', 'second']],
+    ['first\n---\ntitle: real post\n---\nsecond', ['first', 'title: real post', 'second']],
+  ]) {
+    await writeFile(md, source);
+    assert.deepEqual((await readThreadFile(md)).map(post => post.text), texts);
+  }
+  await writeFile(md, '---\n![](one.png)\n---\nsecond\n---');
+  assert.deepEqual(await readThreadFile(md), [
+    { text: '', images: [join(home, 'one.png')] }, { text: 'second', images: [] },
+  ]);
+  await writeFile(md, '---\n \n---\n');
+  assert.deepEqual(await readThreadFile(md), []);
+});
+
+test('Markdown threads reject empty middle posts with their kept position', async () => {
+  const md = join(home, 'empty-middle.md');
+  for (const [source, index] of [
+    ['first\n---\n---\nsecond', 2],
+    ['---\nfirst\n---\nsecond\n---\n \t\n---\nthird\n---', 3],
+  ]) {
+    await writeFile(md, source);
+    await assert.rejects(readThreadFile(md), error => {
+      assert.ok(error instanceof XPosterError);
+      assert.equal(error.code, 'INVALID_INPUT');
+      assert.equal(error.message, `第 ${index} 条帖子为空，请删除多余的 --- 分隔线。`);
+      return true;
+    });
+  }
+});
+
+test('Markdown thread separators inside matching code fences stay in their post', async () => {
+  const md = join(home, 'fences.md');
+  for (const [open, inner, close] of [
+    ['```js', '---', '```'], ['~~~text', '---', '~~~'],
+    ['````', '```\n---\n~~~\n---', '`````'],
+    ['   ~~~text', '```\n---\n~~~not-a-close\n---', '   ~~~~  '],
+  ]) {
+    const first = `first\n${open}\n${inner}\n${close}`;
+    await writeFile(md, `${first}\r\n---\r\nsecond`);
+    assert.deepEqual(await readThreadFile(md), [
+      { text: first.trim(), images: [] }, { text: 'second', images: [] },
+    ]);
+  }
+  const source = 'first\n```\n---\nsecond';
+  await writeFile(md, source);
+  assert.deepEqual(await readThreadFile(md), [{ text: source, images: [] }]);
+});
+
+test('JSON thread files retain empty posts for shared validation', async () => {
+  const json = join(home, 'empty-posts.json');
+  const posts = [{ text: '' }, { text: 'first' }, { text: '' }];
+  await writeFile(json, JSON.stringify(posts));
+  assert.deepEqual(await readThreadFile(json), posts);
 });
 
 

@@ -291,6 +291,8 @@ codex
 
 ## CLI 使用
 
+Markdown 串文会忽略首尾空白分段和文件开头由 `---` 包围、内部非空行均为 `key: value` 的 front matter，代码围栏内的 `---` 不会分割帖子。
+
 CLI 等待浏览器空闲的期限为 10 分钟，等待时只向 stderr 提示一次；到期返回 `BUSY`，本次操作未执行。开始执行后仍等待最终结果。
 
 在仓库根目录运行 `node server/cli.mjs <command>`：

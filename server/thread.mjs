@@ -374,6 +374,34 @@ export async function composeThread(browser, { posts, inReplyTo, scheduledAt, mo
   });
 }
 
+function splitThreadMarkdown(source) {
+  const lines = source.replace(/\r\n?/g, '\n').split('\n');
+  if (lines[0] === '---') {
+    const end = lines.indexOf('---', 1);
+    if (end >= 0 && lines.slice(1, end).every(line => !line.trim() || /^[^:\s][^:]*:.*$/.test(line.trim()))) {
+      lines.splice(0, end + 1);
+    }
+  }
+  const parts = [];
+  let current = [];
+  let fence = null;
+  for (const line of lines) {
+    const marker = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
+    if (fence) {
+      if (marker && marker[1][0] === fence[0] && marker[1].length >= fence.length && !marker[2].trim()) fence = null;
+    } else if (marker && (marker[1][0] === '~' || !marker[2].includes('`'))) {
+      fence = marker[1];
+    } else if (/^[\t ]*---[\t ]*$/.test(line)) {
+      parts.push(current.join('\n'));
+      current = [];
+      continue;
+    }
+    current.push(line);
+  }
+  parts.push(current.join('\n'));
+  return parts;
+}
+
 export async function readThreadFile(path) {
   const file = resolve(expandHome(path));
   let source;
@@ -384,7 +412,7 @@ export async function readThreadFile(path) {
     posts = parseJSON(source);
     if (!Array.isArray(posts)) throw new XPosterError('INVALID_INPUT', '串文 JSON 必须是帖子数组。');
   } else if (extname(file).toLowerCase() === '.md') {
-    posts = source.replace(/\r\n?/g, '\n').split(/^[\t ]*---[\t ]*$/m).map(part => {
+    posts = splitThreadMarkdown(source).map(part => {
       const images = [];
       const text = part.replace(/!\[[^\]\n]*\]\((<[^>\n]+>|[^)\n]+)\)/g, (_, path) => {
         images.push(path.startsWith('<') ? path.slice(1, -1) : path);
@@ -392,6 +420,14 @@ export async function readThreadFile(path) {
       }).trim();
       return { text, images };
     });
+    const hasContent = post => post.text || post.images.length;
+    const first = posts.findIndex(hasContent);
+    posts = first < 0 ? [] : posts.slice(first, posts.findLastIndex(hasContent) + 1);
+    for (const [index, post] of posts.entries()) {
+      if (!hasContent(post)) {
+        throw new XPosterError('INVALID_INPUT', `第 ${index + 1} 条帖子为空，请删除多余的 --- 分隔线。`);
+      }
+    }
   } else throw new XPosterError('INVALID_INPUT', '串文文件仅支持 .json 或 .md。');
   return posts.map(post => {
     if (!post || typeof post !== 'object' || Array.isArray(post)) throw new XPosterError('INVALID_INPUT', '每条帖子必须是对象。');

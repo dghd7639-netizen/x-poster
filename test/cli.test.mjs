@@ -128,7 +128,7 @@ test('CLI routes JSON and Markdown threads through shared validation and limits 
   const image = join(home, 'one.png'); await writeFile(image, 'fixture');
   const json = join(home, 'thread.json'); const md = join(home, 'thread.md');
   await writeFile(json, JSON.stringify([{ text: 'first', images: ['./one.png'] }, { text: 'second' }]));
-  await writeFile(md, 'first\n![](one.png)\n---\nsecond');
+  await writeFile(md, '---\ntitle: ignored\n---\nfirst\n![](one.png)\n```\n---\n```\n---\nsecond\n---\n');
   const chromeURL = new URL('../server/chrome.mjs', import.meta.url).href;
   const preload = `import { Browser } from ${JSON.stringify(chromeURL)};
     Browser.open = async () => ({ isLoggedIn: async () => false, close: async () => {} });`;
@@ -148,4 +148,31 @@ test('CLI routes JSON and Markdown threads through shared validation and limits 
   assert.equal(failure.code, 'RATE_LIMITED'); assert.equal(failure.requested_count, 2); assert.equal(failure.posts_remaining, 1);
   const conflict = run('thread-preview', md, ['--reply-to', '123', '--at', new Date(Date.now() + 86400000).toISOString()]);
   assert.equal(JSON.parse(conflict.stderr).code, 'INVALID_INPUT');
+});
+
+test('CLI thread errors identify empty Markdown and invalid JSON posts without Chrome', { timeout: 4500 }, async t => {
+  const home = await mkdtemp(join(tmpdir(), 'x-poster-cli-thread-errors-'));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const chromeURL = new URL('../server/chrome.mjs', import.meta.url).href;
+  const preload = `import { Browser } from ${JSON.stringify(chromeURL)};
+    Browser.open = async () => { throw new Error('invalid thread must never open a browser'); };`;
+  for (const [name, source, index, message] of [
+    ['middle.md', '---\nfirst\n---\n---\nsecond', 2, '第 2 条帖子为空，请删除多余的 --- 分隔线。'],
+    ['empty.json', JSON.stringify([{ text: 'first' }, { text: 'second' }, {}]), 3, '第 3 条帖子：请至少提供文字或一张图片。'],
+    ['image.json', JSON.stringify([{ text: 'first' }, { images: ['./missing.png'] }]), 2, '第 2 条帖子：图片文件不存在或无法读取。'],
+  ]) {
+    const file = join(home, name);
+    await writeFile(file, source);
+    const result = spawnSync(process.execPath,
+      ['--import', `data:text/javascript,${encodeURIComponent(preload)}`,
+        fileURLToPath(new URL('../server/cli.mjs', import.meta.url)), 'thread-preview', '--file', file],
+      { env: { ...process.env, X_POSTER_HOME: home, X_POSTER_CHROME_PATH: '/must-not-launch' }, encoding: 'utf8', timeout: 1500 });
+    assert.equal(result.status, 1, result.stderr);
+    assert.equal(result.stdout, '');
+    const error = JSON.parse(result.stderr);
+    assert.equal(error.code, 'INVALID_INPUT');
+    assert.equal(error.message, message);
+    if (name.endsWith('.json')) assert.equal(error.post_index, index);
+    if (name === 'image.json') assert.equal(error.hint, '请检查图片的完整路径和文件权限。');
+  }
 });
