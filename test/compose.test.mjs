@@ -27,7 +27,22 @@ function fixture(options = {}) {
     contains: () => false,
   };
   const inlineEditor = { textContent: 'timeline draft', innerText: 'timeline draft' };
-  const button = { disabled: false, getAttribute: () => 'false' };
+  const makeButton = testid => {
+    const attributes = { 'data-testid': testid };
+    return {
+      disabled: false, clicked: 0,
+      getAttribute: name => attributes[name] ?? null,
+      setAttribute: (name, value) => { attributes[name] = value; },
+      removeAttribute: name => { delete attributes[name]; },
+    };
+  };
+  const button = makeButton(state.inline ? 'tweetButtonInline' : 'tweetButton');
+  const backgroundButton = makeButton('tweetButtonInline');
+  const postButtons = [button, backgroundButton];
+  const taggedSelector = '[data-x-poster-post="1"]';
+  const findPostButton = selector => [backgroundButton, ...postButtons.filter(candidate => candidate !== backgroundButton)].find(candidate =>
+    !(state.missingButton && candidate === button) && (selector === `[data-testid=${candidate.getAttribute('data-testid')}]`
+    || selector === taggedSelector && candidate.getAttribute('data-x-poster-post') === '1')) ?? null;
   const diagnosticButton = (testid, label, text, disabled = false) => ({
     innerText: text, disabled,
     getAttribute: name => ({ 'data-testid': testid, 'aria-label': label, 'aria-disabled': 'false' })[name] ?? null,
@@ -44,11 +59,13 @@ function fixture(options = {}) {
   const bounds = () => state.diagnosticRect ?? { x: 20, y: 30, right: 420, bottom: 330, width: 400, height: 300 };
   const root = {
     getBoundingClientRect: bounds,
+    querySelector: selector => !state.missingButton && selector === `[data-testid=${button.getAttribute('data-testid')}]` ? button : null,
     querySelectorAll: selector => selector === '[data-testid]' ? composerTestids()
       : selector === 'button, [role=button]' ? composerButtons : [],
   };
   editor.closest = () => state.modal ? root : null;
   editor.parentElement.querySelectorAll = root.querySelectorAll;
+  editor.parentElement.querySelector = root.querySelector;
   editor.parentElement.getBoundingClientRect = bounds;
   editor.parentElement.parentElement = root;
   const attachment = { innerText: '', querySelector: () => null };
@@ -65,14 +82,15 @@ function fixture(options = {}) {
   const document = {
     readyState: 'complete',
     querySelector(selector) {
-      if (selector === SELECTORS.dialog) return state.modal ? root : null;
+      if (selector === SELECTORS.dialog) return state.modal || state.unrelatedDialog ? root : null;
       if (selector.endsWith(SELECTORS.editor) && state.missingEditor) return null;
       if (selector.endsWith(SELECTORS.postButton) && state.missingButton) return null;
       if (selector === SELECTORS.scheduleConfirm && state.scheduleDialog) return button;
       if (selector === '[data-testid=emptyState]' && state.empty) return {};
       if (selector === scope + SELECTORS.editor) return editor;
       if (selector === SELECTORS.editor) return inlineEditor;
-      if (selector === scope + SELECTORS.postButton) return button;
+      if (selector === scope + SELECTORS.postButton && !state.inline) return button;
+      if (!selector.startsWith(SELECTORS.dialog) && findPostButton(selector)) return findPostButton(selector);
       if (selector === SELECTORS.profileLink) return { getAttribute: () => '/alice' };
       if (selector === SELECTORS.toast && state.toast) return {
         innerText: state.toast, querySelector: () => state.toastHref ? { getAttribute: () => state.toastHref } : null,
@@ -80,6 +98,11 @@ function fixture(options = {}) {
       return null;
     },
     querySelectorAll(selector) {
+      if (selector === SELECTORS.editor) return state.missingEditor ? []
+        : state.modal || state.multipleEditors ? [editor, inlineEditor] : [editor];
+      if (selector === '[data-x-poster-post]' || selector === taggedSelector) {
+        return postButtons.filter(candidate => candidate.getAttribute('data-x-poster-post') !== null);
+      }
       const allTestids = [...composerTestids(), accountButton, ...(state.outsideTestids ?? []).map(testidNode)];
       if (selector === '[data-testid]') return allTestids;
       const match = selector.match(/^\[data-testid="([^"]+)"\]$/);
@@ -132,6 +155,10 @@ function fixture(options = {}) {
       calls.push(['click', selector]);
       if (selector.endsWith(SELECTORS.scheduleButton)) { state.scheduleDialog = true; return; }
       if (selector === SELECTORS.scheduleConfirm) { state.scheduleDialog = false; return; }
+      const clicked = selector === scope + SELECTORS.postButton && !state.inline ? button : findPostButton(selector);
+      assert.ok(clicked, `button must exist: ${selector}`);
+      assert.equal(clicked.disabled || clicked.getAttribute('aria-disabled') === 'true', false);
+      clicked.clicked++;
       state.onSubmit?.();
       if (state.clickError) throw state.clickError;
       if (state.noResponse) return;
@@ -141,13 +168,25 @@ function fixture(options = {}) {
     },
     async close() { this.closed = true; },
   };
-  return { browser: { newPage: async () => page }, page, state, calls, events, inlineEditor, selects, editor, root, composerButtons, diagnosticButton };
+  return { browser: { newPage: async () => page }, page, state, calls, events, inlineEditor, selects, editor, root,
+    composerButtons, diagnosticButton, button, backgroundButton, postButtons, makeButton };
 }
 
 async function input(t, overrides = {}) {
   const dir = await mkdtemp(join(tmpdir(), 'x-poster-compose-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
   return { text: 'hello\n你好 🚀', images: [], submit: false, screenshotPath: join(dir, 'preview.png'), weightedLength: 13, ...overrides };
+}
+
+function fastMissingButton(t, page) {
+  let now = 0;
+  t.mock.method(Date, 'now', () => now);
+  const call = page.call;
+  page.call = async (fn, ...args) => {
+    const result = await call(fn, ...args);
+    if (result?.button === 'missing') now += 20000;
+    return result;
+  };
 }
 
 test('preview scopes the modal, falls back to trusted multiline text and never submits', async t => {
@@ -172,6 +211,140 @@ test('confirmed network body returns the post id and removes response listeners'
   assert.ok(calls.some(call => call[1] === 'Network.getResponseBody'));
   assert.equal(events.size, 0);
   assert.equal(page.closed, true);
+});
+
+test('inline preview uses the editor container even when an unrelated dialog exists', { timeout: 4500 }, async t => {
+  for (const unrelatedDialog of [false, true]) {
+    const f = fixture({ modal: false, inline: true, unrelatedDialog });
+    fastMissingButton(t, f.page);
+    const result = await compose(f.browser, await input(t));
+    assert.equal(result.username, 'alice');
+    assert.deepEqual(f.calls.find(call => call[0] === 'screenshot')[1], { x: 8, y: 18, width: 424, height: 324 });
+    assert.equal(f.button.clicked, 0);
+    assert.equal(f.backgroundButton.clicked, 0);
+  }
+});
+
+test('inline post clicks only its own button and returns the confirmed id', { timeout: 4500 }, async t => {
+  const f = fixture({ modal: false, inline: true });
+  fastMissingButton(t, f.page);
+  f.backgroundButton.setAttribute('data-x-poster-post', '1');
+  const result = await compose(f.browser, await input(t, { mode: 'post' }));
+  assert.equal(result.id, '123');
+  assert.equal(f.button.clicked, 1);
+  assert.equal(f.backgroundButton.clicked, 0);
+  assert.equal(f.backgroundButton.getAttribute('data-x-poster-post'), null);
+  assert.equal(f.button.getAttribute('data-x-poster-post'), '1');
+});
+
+test('standard dialog post ignores the background inline button', { timeout: 4500 }, async t => {
+  const f = fixture();
+  await compose(f.browser, await input(t, { mode: 'post' }));
+  assert.equal(f.button.clicked, 1);
+  assert.equal(f.backgroundButton.clicked, 0);
+  assert.equal(f.button.getAttribute('data-x-poster-post'), null);
+});
+
+test('multiple unscoped first editors raise UI_CHANGED without any click', { timeout: 4500 }, async t => {
+  let now = 0;
+  t.mock.method(Date, 'now', () => now += 20000);
+  const f = fixture({ modal: false, inline: true, multipleEditors: true });
+  await assert.rejects(compose(f.browser, await input(t, { mode: 'post' })), error => {
+    assert.equal(error.code, 'UI_CHANGED');
+    assert.match(error.message, /多个发帖框/);
+    return true;
+  });
+  assert.equal(f.calls.some(call => call[0] === 'click'), false);
+});
+
+test('missing unscoped button preserves the original error and selector', { timeout: 4500 }, async t => {
+  let now = 0;
+  t.mock.method(Date, 'now', () => now += 20000);
+  const f = fixture({ modal: false, missingButton: true });
+  await assert.rejects(compose(f.browser, await input(t, { mode: 'post' })), error => {
+    assert.equal(error.code, 'UI_CHANGED');
+    assert.equal(error.message, '找不到发布按钮。');
+    assert.equal(error.details.selector, SELECTORS.postButton);
+    return true;
+  });
+  assert.equal(f.calls.some(call => call[0] === 'click'), false);
+});
+
+test('button resolution stops at the nearest ancestor and prefers tweetButton only within it', async () => {
+  const f = fixture({ modal: false, inline: true });
+  const standard = f.makeButton('tweetButton');
+  f.root.querySelector = selector => selector === SELECTORS.postButton ? standard : null;
+  assert.equal(await x.postButtonSelector(f.page, ''), '[data-x-poster-post="1"]');
+  assert.equal(f.button.getAttribute('data-x-poster-post'), '1');
+  assert.equal(standard.getAttribute('data-x-poster-post'), null);
+  // The two button names now share the nearest container.
+  f.postButtons.push(standard);
+  f.editor.parentElement.querySelector = selector => selector === SELECTORS.postButton ? standard : f.button;
+  await x.postButtonSelector(f.page, '');
+  assert.equal(f.button.getAttribute('data-x-poster-post'), null);
+  assert.equal(standard.getAttribute('data-x-poster-post'), '1');
+});
+
+test('button resolution searches at most twelve ancestors and clears stale tags', async () => {
+  for (const depth of [12, 13]) {
+    const f = fixture({ modal: false, inline: true });
+    let ancestor = f.editor.parentElement;
+    for (let i = 1; i < depth; i++) ancestor = { parentElement: ancestor, querySelector: () => null };
+    f.editor.parentElement = ancestor;
+    f.backgroundButton.setAttribute('data-x-poster-post', 'stale');
+    assert.equal(await x.postButtonSelector(f.page, ''), depth === 12 ? '[data-x-poster-post="1"]' : SELECTORS.postButton);
+    assert.equal(f.backgroundButton.getAttribute('data-x-poster-post'), null);
+  }
+  const missing = fixture({ modal: false, missingEditor: true });
+  assert.equal(await x.postButtonSelector(missing.page, ''), SELECTORS.postButton);
+});
+
+test('inline readiness re-resolves a button replaced between polls', { timeout: 4500 }, async t => {
+  const f = fixture({ modal: false, inline: true });
+  const replacement = f.makeButton('tweetButtonInline');
+  f.postButtons.push(replacement);
+  const call = f.page.call;
+  let polls = 0;
+  f.page.call = async (fn, ...args) => {
+    const result = await call(fn, ...args);
+    if (result?.button === 'enabled' && ++polls === 1) {
+      f.editor.parentElement.querySelector = selector => selector === '[data-testid=tweetButtonInline]' ? replacement : null;
+    }
+    return result;
+  };
+  const result = await compose(f.browser, await input(t, { mode: 'post' }));
+  assert.equal(result.id, '123');
+  assert.ok(polls >= 2);
+  assert.equal(f.button.clicked, 0);
+  assert.equal(replacement.clicked, 1);
+});
+
+test('inline disabled buttons never submit', { timeout: 4500 }, async t => {
+  let now = 0;
+  t.mock.method(Date, 'now', () => now += 9000);
+  const f = fixture({ modal: false, inline: true });
+  f.button.setAttribute('aria-disabled', 'true');
+  await assert.rejects(compose(f.browser, await input(t, { mode: 'post' })), error => error.code === 'TEXT_REJECTED');
+  assert.equal(f.calls.some(call => call[0] === 'click'), false);
+});
+
+test('a button disabled after readiness is never clicked for post or schedule', { timeout: 4500 }, async t => {
+  for (const mode of ['post', 'schedule']) {
+    const f = fixture({ modal: false, inline: true });
+    const screenshot = f.page.screenshot;
+    f.page.screenshot = async clip => { f.button.disabled = true; return screenshot(clip); };
+    await assert.rejects(compose(f.browser, await input(t, { mode, ...(mode === 'schedule' ? { scheduledAt } : {}) })),
+      error => error.code === 'UI_CHANGED' && /禁用/.test(error.message));
+    assert.equal(f.calls.some(call => call[0] === 'click' && call[1] === '[data-x-poster-post="1"]'), false);
+  }
+});
+
+test('inline scheduling resolves the same composer button after confirming the time', { timeout: 4500 }, async t => {
+  const f = fixture({ modal: false, inline: true, scheduling: true, body: '{"data":{"tweet":{"rest_id":"999"}}}' });
+  const result = await compose(f.browser, await input(t, { mode: 'schedule', scheduledAt }));
+  assert.equal(result.id, '999');
+  assert.equal(f.button.clicked, 1);
+  assert.equal(f.backgroundButton.clicked, 0);
 });
 
 test('X duplicate rejection is preserved with the Chinese hint', async t => {

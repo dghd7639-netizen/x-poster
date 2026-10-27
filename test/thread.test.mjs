@@ -32,7 +32,13 @@ function fixture(options = {}) {
   const events = new Map();
   const state = { active: 0, editors: [], attachments: new Set(), pathname: '/compose/post',
     replyHandle: 'Alice', username: 'alice', modal: true, scrollHeight: 600, containers: [], viewportHeight: 800, ...options };
-  const button = { disabled: false, getAttribute: () => 'false' };
+  const buttonAttributes = { 'data-testid': options.inline ? 'tweetButtonInline' : 'tweetButton' };
+  const button = {
+    disabled: false, clicked: 0,
+    getAttribute: name => buttonAttributes[name] ?? null,
+    setAttribute: (name, value) => { buttonAttributes[name] = value; },
+    removeAttribute: name => { delete buttonAttributes[name]; },
+  };
   const position = function(other) { return this.order === other.order ? 0 : this.order < other.order ? 4 : 2; };
   const attachmentAt = index => ({ order: index * 10 + 5, innerText: '', querySelector: () => null, compareDocumentPosition: position });
   const target = { innerText: 'original target' };
@@ -48,12 +54,15 @@ function fixture(options = {}) {
     get innerText() { return `Replying to @${state.replyHandle}\noriginal target`; },
     getBoundingClientRect() { return state.rect ?? { x: 100, y: 40, right: 740, bottom: 640, width: 640, height: 600 }; },
     querySelector(selector) {
+      if (selector === `[data-testid=${buttonAttributes['data-testid']}]`) return button;
+      if (selector === '[data-x-poster-post="1"]') return buttonAttributes['data-x-poster-post'] === '1' ? button : null;
       if (selector === '[data-testid=tweetText]' || selector === '[data-testid=tweet], [data-testid=tweetText]') return state.noTarget ? null : target;
       const match = selector.match(/^\[data-testid=tweetTextarea_(\d+)\]$/);
       if (match) return state.editors[Number(match[1])] ?? null;
       return this.querySelectorAll(selector)[0] ?? null;
     },
     querySelectorAll(selector) {
+      if (selector === '[data-testid=tweetTextarea_0]') return [state.editors[0]];
       if (selector === '*') return [inner, ...state.containers, ...state.editors];
       if (selector === 'div, span') return [
         { innerText: state.replyLabel ?? `Replying to @${state.replyHandle}`, closest: () => null, querySelector: () => null },
@@ -113,6 +122,7 @@ function fixture(options = {}) {
     body: pageBody, documentElement: pageBody, scrollingElement: pageBody,
     get activeElement() { return state.activeElement; },
     querySelector(selector) {
+      if (selector === '[data-x-poster-post="1"]') return buttonAttributes['data-x-poster-post'] === '1' ? button : null;
       if (selector === '[data-testid=scheduledConfirmationPrimaryAction]') return state.schedulingDialog ? button : null;
       if (selector === '[data-testid=AppTabBar_Profile_Link]') return state.username ? { getAttribute: () => '/' + state.username } : null;
       if (selector === 'main') return root;
@@ -121,11 +131,12 @@ function fixture(options = {}) {
       if (selector.startsWith('[role=dialog] ') && !state.modal) return null;
       const match = selector.match(/\[data-testid=tweetTextarea_(\d+)\]/);
       if (match) return state.editors[Number(match[1])] ?? null;
-      if (selector.endsWith('[data-testid=tweetButton]')) return button;
+      if (selector.endsWith(`[data-testid=${buttonAttributes['data-testid']}]`)) return button;
       if (selector === '[role=dialog]') return state.modal ? root : null;
       return null;
     },
     querySelectorAll(selector) {
+      if (selector === '[data-x-poster-post]') return buttonAttributes['data-x-poster-post'] ? [button] : [];
       if (selector === '[role=dialog]') return state.schedulingDialog ? [root, scheduleDialog] : state.modal ? [root] : [];
       return root.querySelectorAll(selector.replace('[role=dialog] ', ''));
     },
@@ -178,6 +189,9 @@ function fixture(options = {}) {
         if (!state.lostFocus) state.editors[index].focus();
         return;
       }
+      assert.equal(document.querySelector(selector), button);
+      assert.equal(button.disabled || button.getAttribute('aria-disabled') === 'true', false);
+      button.clicked++;
       state.onSubmit?.();
       if (state.clickError) throw state.clickError;
       if (state.noResponse) return;
@@ -200,7 +214,7 @@ function fixture(options = {}) {
     },
     async close() { this.closed = true; },
   };
-  return { browser: { newPage: async () => page }, page, state, calls, events, emit, root, inner, pageBody };
+  return { browser: { newPage: async () => page }, page, state, calls, events, emit, root, inner, pageBody, button };
 }
 
 function isolatedHistory(t, options = {}) {
@@ -337,6 +351,47 @@ test('immediate compose returns N sequential ids and closes its fresh page', { t
   const f = fixture();
   assert.deepEqual((await composeThread(f.browser, args())).posted_ids, ['100', '101']);
   assert.equal(f.page.closed, true);
+  assert.equal(f.events.size, 0);
+});
+
+test('inline thread publishes two posts with its resolved button', { timeout: 4500 }, async () => {
+  const f = fixture({ modal: false, inline: true });
+  assert.deepEqual((await composeThread(f.browser, args())).posted_ids, ['100', '101']);
+  assert.deepEqual(f.state.editors.map(editor => editor.innerText), ['first', 'second']);
+  assert.equal(f.button.clicked, 1);
+  assert.equal(f.calls.filter(call => call[0] === 'click' && call[1] === '[data-x-poster-post="1"]').length, 1);
+  assert.equal(f.page.closed, true);
+  assert.equal(f.events.size, 0);
+});
+
+test('inline thread preview captures both posts without submitting', { timeout: 4500 }, async () => {
+  const f = fixture({ modal: false, inline: true });
+  const result = await composeThread(f.browser, args({ mode: 'preview' }));
+  assert.equal(result.screenshots.length, 1);
+  assert.deepEqual(f.state.editors.map(editor => editor.innerText), ['first', 'second']);
+  assert.equal(f.button.clicked, 0);
+  assert.equal(f.calls.some(call => call[0] === 'document-scroll'), false);
+});
+
+test('inline thread keeps attachments with their editor without a reply target', { timeout: 4500 }, async () => {
+  const f = fixture({ modal: false, inline: true, noTarget: true });
+  const posts = input(['first', 'second']);
+  posts[1].images = ['/tmp/second.png'];
+  assert.deepEqual((await composeThread(f.browser, args({ posts }))).posted_ids, ['100', '101']);
+  assert.deepEqual(f.calls.filter(call => call[0] === 'files'), [['files', 1, ['/tmp/second.png']]]);
+  assert.equal(f.button.clicked, 1);
+});
+
+test('inline thread refuses a button disabled just before submission', { timeout: 4500 }, async () => {
+  const f = fixture({ modal: false, inline: true });
+  const call = f.page.call;
+  f.page.call = async (fn, ...parameters) => {
+    const result = await call(fn, ...parameters);
+    if (result === 'alice') f.button.disabled = true;
+    return result;
+  };
+  await assert.rejects(composeThread(f.browser, args()), error => error.code === 'UI_CHANGED' && /禁用/.test(error.message));
+  assert.equal(f.button.clicked, 0);
   assert.equal(f.events.size, 0);
 });
 

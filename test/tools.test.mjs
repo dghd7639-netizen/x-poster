@@ -380,7 +380,8 @@ test('confirmed post survives username-state failure and is recorded before retu
       navigate: async () => {},
       waitFor: async () => 'editor',
       setFiles: async () => {},
-      call: async () => {
+      call: async (fn, ...args) => {
+        if (args[0] === '[role=dialog] [data-testid=tweetButton]') return false;
         snapshot++;
         if (snapshot <= 2) return { button: 'enabled', hasAttachments: true, uploading: false, toast: null };
         return snapshot === 3 ? null : 'alice';

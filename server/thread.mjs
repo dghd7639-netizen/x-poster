@@ -3,7 +3,7 @@ import { dirname, extname, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { XPosterError } from './errors.mjs';
 import { expandHome } from './config.mjs';
-import { CREATE_POST_URL, SELECTORS, openComposer, fillText, waitUntilReady, setSchedule,
+import { CREATE_POST_URL, SELECTORS, openComposer, fillText, waitUntilReady, setSchedule, postButtonSelector, clickPostButton,
   readUsername, parseCreatePostResponse, parseCreateScheduledResponse, captureUIDiagnostics } from './x.mjs';
 
 const normalized = text => text == null ? '' : typeof text === 'string' ? text.trim().replace(/\s+/gu, ' ') : null;
@@ -145,7 +145,7 @@ async function submitThread(page, scope, posts, scheduled) {
   await page.send('Network.enable');
   const watcher = watchThreadResponses(page, posts, { scheduled });
   try {
-    try { await page.click(scope + SELECTORS.postButton); }
+    try { await clickPostButton(page, scope); }
     catch (error) {
       if (error instanceof XPosterError && error.code === 'UI_CHANGED') throw error;
       throw uncertainThread(watcher.postedIds(), scheduled, posts.length);
@@ -202,13 +202,20 @@ async function focusThreadEditor(page, scope, index) {
 // This function runs in the page; all inspected and scrolled nodes stay inside the composer.
 function composerState(reply, { index, offset } = {}) {
   const editor = document.querySelector('[role=dialog] [data-testid=tweetTextarea_0]')
-    ?? (reply ? document.querySelector('[data-testid=tweetTextarea_0]') : null);
+    ?? document.querySelector('[data-testid=tweetTextarea_0]');
   if (!editor) return null;
   let root = editor.closest('[role=dialog]');
   if (!root && reply) {
     root = editor.parentElement;
     while (root && root !== document.body && root !== document.documentElement
       && !root.querySelector('[data-testid=tweet], [data-testid=tweetText]')) root = root.parentElement;
+  }
+  if (!root && !reply) {
+    let ancestor = editor.parentElement;
+    for (let level = 0; ancestor && level < 12; level++, ancestor = ancestor.parentElement) {
+      if (ancestor === document.body || ancestor === document.documentElement) break;
+      if (ancestor.querySelector('[data-x-poster-post="1"]')) { root = ancestor; break; }
+    }
   }
   if (!root || root === document.body || root === document.documentElement) return null;
   if (index !== undefined) {
@@ -237,6 +244,7 @@ function composerState(reply, { index, offset } = {}) {
 }
 
 export async function fillThread(page, scope, posts) {
+  await postButtonSelector(page, scope);
   for (const [index, post] of posts.entries()) {
     if (index) await page.click(scope + SELECTORS.addButton);
     const editor = scope + editorAt(index);
@@ -247,7 +255,7 @@ export async function fillThread(page, scope, posts) {
     if (post.images.length) {
       await focusThreadEditor(page, scope, index);
       await page.setFiles(scope + SELECTORS.fileInput, post.images);
-      if (!await page.waitFor(composerState, [!scope, { index }], { timeout: 10000 })) {
+      if (!await page.waitFor(composerState, [false, { index }], { timeout: 10000 })) {
         throw new XPosterError('UI_CHANGED', '图片未出现在当前帖子编辑器之后、下一条帖子之前，已停止。', { selector: editor });
       }
     }
