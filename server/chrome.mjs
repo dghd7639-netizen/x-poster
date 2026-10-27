@@ -418,6 +418,38 @@ export class Browser {
   }
 }
 
+async function renderingStep(action, timeout) {
+  let timer;
+  try {
+    return await Promise.race([
+      Promise.resolve().then(action),
+      new Promise(resolve => { timer = setTimeout(() => resolve(null), timeout); }),
+    ]);
+  } catch { return null; }
+  finally { clearTimeout(timer); }
+}
+
+function measureFrames() {
+  return new Promise(resolve => {
+    let frames = 0;
+    let frame;
+    let done = false;
+    const finish = () => {
+      done = true;
+      cancelAnimationFrame(frame);
+      resolve({ frames, visibility: document.visibilityState });
+    };
+    // Finish with a timer even when the background tab never supplies a frame.
+    setTimeout(finish, 500);
+    const count = () => {
+      if (done) return;
+      frames++;
+      frame = requestAnimationFrame(count);
+    };
+    frame = requestAnimationFrame(count);
+  });
+}
+
 export class Page {
   constructor(cdp, targetId, sessionId) {
     this.cdp = cdp;
@@ -425,7 +457,40 @@ export class Page {
     this.sessionId = sessionId;
   }
 
-  send(method, params = {}) { return this.cdp.send(method, params, this.sessionId); }
+  send(method, params = {}, timeout) { return this.cdp.send(method, params, this.sessionId, timeout); }
+
+  async ensureRendering() {
+    const measure = async () => {
+      const response = await renderingStep(() => this.send('Runtime.evaluate', {
+        expression: `(${measureFrames.toString()})()`, returnByValue: true, awaitPromise: true,
+      }, 1500), 1500);
+      const value = response?.exceptionDetails ? null : response?.result?.value;
+      return { frames: Number.isInteger(value?.frames) && value.frames >= 0 ? value.frames : null,
+        visibility: ['visible', 'hidden', 'prerender'].includes(value?.visibility) ? value.visibility : null };
+    };
+    let sample = await measure();
+    const result = { stalled: sample.frames === null || sample.frames * 2 < 5,
+      initial_frames: sample.frames, remedy: null, final_frames: sample.frames, visibility: sample.visibility };
+    if (!result.stalled) {
+      result.frames = sample.frames;
+      return (this.rendering = result);
+    }
+    // Three 1500 ms measurements plus two 400 ms commands and 300 ms waits: at most 5900 ms.
+    for (const [remedy, method, params] of [
+      ['focus_emulation', 'Emulation.setFocusEmulationEnabled', { enabled: true }],
+      ['bring_to_front', 'Page.bringToFront', {}],
+    ]) {
+      result.remedy = remedy;
+      await renderingStep(() => this.send(method, params, 400), 400);
+      await renderingStep(() => delay(300), 300);
+      sample = await measure();
+      result.final_frames = sample.frames;
+      result.visibility = sample.visibility;
+      result.stalled = sample.frames === null || sample.frames * 2 < 5;
+      if (!result.stalled) break;
+    }
+    return (this.rendering = result);
+  }
 
   on(method, handler) {
     return this.cdp.on(event => {

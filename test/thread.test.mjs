@@ -36,8 +36,6 @@ function fixture(options = {}) {
   const button = {
     disabled: false, clicked: 0,
     getAttribute: name => buttonAttributes[name] ?? null,
-    setAttribute: (name, value) => { buttonAttributes[name] = value; },
-    removeAttribute: name => { delete buttonAttributes[name]; },
   };
   const position = function(other) { return this.order === other.order ? 0 : this.order < other.order ? 4 : 2; };
   const attachmentAt = index => ({ order: index * 10 + 5, innerText: '', querySelector: () => null, compareDocumentPosition: position });
@@ -55,7 +53,6 @@ function fixture(options = {}) {
     getBoundingClientRect() { return state.rect ?? { x: 100, y: 40, right: 740, bottom: 640, width: 640, height: 600 }; },
     querySelector(selector) {
       if (selector === `[data-testid=${buttonAttributes['data-testid']}]`) return button;
-      if (selector === '[data-x-poster-post="1"]') return buttonAttributes['data-x-poster-post'] === '1' ? button : null;
       if (selector === '[data-testid=tweetText]' || selector === '[data-testid=tweet], [data-testid=tweetText]') return state.noTarget ? null : target;
       const match = selector.match(/^\[data-testid=tweetTextarea_(\d+)\]$/);
       if (match) return state.editors[Number(match[1])] ?? null;
@@ -122,7 +119,6 @@ function fixture(options = {}) {
     body: pageBody, documentElement: pageBody, scrollingElement: pageBody,
     get activeElement() { return state.activeElement; },
     querySelector(selector) {
-      if (selector === '[data-x-poster-post="1"]') return buttonAttributes['data-x-poster-post'] === '1' ? button : null;
       if (selector === '[data-testid=scheduledConfirmationPrimaryAction]') return state.schedulingDialog ? button : null;
       if (selector === '[data-testid=AppTabBar_Profile_Link]') return state.username ? { getAttribute: () => '/' + state.username } : null;
       if (selector === 'main') return root;
@@ -136,7 +132,6 @@ function fixture(options = {}) {
       return null;
     },
     querySelectorAll(selector) {
-      if (selector === '[data-x-poster-post]') return buttonAttributes['data-x-poster-post'] ? [button] : [];
       if (selector === '[role=dialog]') return state.schedulingDialog ? [root, scheduleDialog] : state.modal ? [root] : [];
       return root.querySelectorAll(selector.replace('[role=dialog] ', ''));
     },
@@ -153,6 +148,7 @@ function fixture(options = {}) {
   };
   const page = {
     closed: false,
+    async ensureRendering() { calls.push(['ensureRendering']); },
     async navigate(url) { calls.push(['navigate', url]); },
     async call(fn, ...args) {
       return runInNewContext(`(${fn.toString()})(...args)`, {
@@ -354,45 +350,21 @@ test('immediate compose returns N sequential ids and closes its fresh page', { t
   assert.equal(f.events.size, 0);
 });
 
-test('inline thread publishes two posts with its resolved button', { timeout: 4500 }, async () => {
+test('thread inline-only state stops before filling or submitting', async () => {
   const f = fixture({ modal: false, inline: true });
-  assert.deepEqual((await composeThread(f.browser, args())).posted_ids, ['100', '101']);
-  assert.deepEqual(f.state.editors.map(editor => editor.innerText), ['first', 'second']);
-  assert.equal(f.button.clicked, 1);
-  assert.equal(f.calls.filter(call => call[0] === 'click' && call[1] === '[data-x-poster-post="1"]').length, 1);
+  await assert.rejects(composeThread(f.browser, args()), error => error.code === 'UI_CHANGED' && !!error.details.diagnostics);
+  assert.deepEqual(f.state.editors.map(editor => editor.innerText), ['']);
+  assert.equal(f.calls.some(call => call[0] === 'click' || call[0] === 'files'), false);
+  assert.equal(f.button.clicked, 0);
   assert.equal(f.page.closed, true);
-  assert.equal(f.events.size, 0);
 });
 
-test('inline thread preview captures both posts without submitting', { timeout: 4500 }, async () => {
-  const f = fixture({ modal: false, inline: true });
-  const result = await composeThread(f.browser, args({ mode: 'preview' }));
-  assert.equal(result.screenshots.length, 1);
-  assert.deepEqual(f.state.editors.map(editor => editor.innerText), ['first', 'second']);
-  assert.equal(f.button.clicked, 0);
-  assert.equal(f.calls.some(call => call[0] === 'document-scroll'), false);
-});
-
-test('inline thread keeps attachments with their editor without a reply target', { timeout: 4500 }, async () => {
-  const f = fixture({ modal: false, inline: true, noTarget: true });
-  const posts = input(['first', 'second']);
-  posts[1].images = ['/tmp/second.png'];
-  assert.deepEqual((await composeThread(f.browser, args({ posts }))).posted_ids, ['100', '101']);
-  assert.deepEqual(f.calls.filter(call => call[0] === 'files'), [['files', 1, ['/tmp/second.png']]]);
-  assert.equal(f.button.clicked, 1);
-});
-
-test('inline thread refuses a button disabled just before submission', { timeout: 4500 }, async () => {
-  const f = fixture({ modal: false, inline: true });
-  const call = f.page.call;
-  f.page.call = async (fn, ...parameters) => {
-    const result = await call(fn, ...parameters);
-    if (result === 'alice') f.button.disabled = true;
-    return result;
-  };
-  await assert.rejects(composeThread(f.browser, args()), error => error.code === 'UI_CHANGED' && /禁用/.test(error.message));
-  assert.equal(f.button.clicked, 0);
-  assert.equal(f.events.size, 0);
+test('thread checks rendering immediately after each composer navigation', async () => {
+  const f = fixture();
+  await composeThread(f.browser, args({ inReplyTo: '999' }));
+  const navigations = f.calls.flatMap((call, index) => call[0] === 'navigate' ? [index] : []);
+  assert.equal(navigations.length, 2);
+  for (const index of navigations) assert.equal(f.calls[index + 1][0], 'ensureRendering');
 });
 
 test('thread UI_CHANGED captures diagnostics from fill, preview, submit and own-reply checks', { timeout: 4500 }, async () => {

@@ -106,6 +106,10 @@ export async function captureUIDiagnostics(page, screenshotPath) {
   try {
     const snapshot = await diagnosticStep(() => page.call(readUIDiagnostics, SELECTORS), 1500);
     const diagnostics = snapshot?.diagnostics ?? {};
+    if (page.rendering) {
+      const { initial_frames, remedy, final_frames, visibility } = page.rendering;
+      diagnostics.rendering = { initial_frames, remedy, final_frames, visibility };
+    }
     const screenshot = snapshot?.clip !== false && await diagnosticStep(() => page.screenshot(snapshot?.clip), 1500);
     const path = screenshot && await diagnosticStep(async () => {
       if (typeof screenshotPath !== 'string' || !/\.png$/.test(screenshotPath)) return null;
@@ -360,42 +364,6 @@ function textRejected(weightedLength, toast) {
   });
 }
 
-export async function postButtonSelector(page, scope) {
-  if (scope) return scope + SELECTORS.postButton;
-  const selector = '[data-x-poster-post="1"]';
-  const result = await page.call((editorSelector, postSelector, taggedSelector) => {
-    for (const element of document.querySelectorAll('[data-x-poster-post]')) {
-      element.removeAttribute('data-x-poster-post');
-    }
-    const editors = document.querySelectorAll(editorSelector);
-    if (editors.length > 1) return 'ambiguous';
-    let ancestor = editors[0]?.parentElement;
-    for (let level = 0; ancestor && level < 12; level++, ancestor = ancestor.parentElement) {
-      // The page itself can contain unrelated composers.
-      if (ancestor === document.body || ancestor === document.documentElement) break;
-      const button = ancestor.querySelector(postSelector) ?? ancestor.querySelector('[data-testid=tweetButtonInline]');
-      if (!button) continue;
-      button.setAttribute('data-x-poster-post', '1');
-      return taggedSelector;
-    }
-    return null;
-  }, SELECTORS.editor, SELECTORS.postButton, selector);
-  if (result === 'ambiguous') {
-    throw new XPosterError('UI_CHANGED', '页面上有多个发帖框，无法确定要点击哪一个。', { selector: SELECTORS.editor });
-  }
-  return result ?? SELECTORS.postButton;
-}
-
-export async function clickPostButton(page, scope) {
-  const selector = await postButtonSelector(page, scope);
-  const disabled = await page.call(selector => {
-    const button = document.querySelector(selector);
-    return !!button && (!!button.disabled || button.getAttribute('aria-disabled') === 'true');
-  }, selector);
-  if (disabled) throw new XPosterError('UI_CHANGED', '发布按钮已禁用，已停止发布。', { selector });
-  await page.click(selector);
-}
-
 export async function waitUntilReady(page, scope, images, weightedLength, editorSelector) {
   const deadline = Date.now() + (images.length ? 120000 : 15000);
   let readyPolls = 0;
@@ -404,9 +372,8 @@ export async function waitUntilReady(page, scope, images, weightedLength, editor
   let snapshot;
   let settled = false;
   while (true) {
-    const buttonSelector = await postButtonSelector(page, scope);
-    snapshot = await page.call((scope, selectors, editorSelector, buttonSelector) => {
-      const button = document.querySelector(buttonSelector);
+    snapshot = await page.call((scope, selectors, editorSelector) => {
+      const button = document.querySelector(scope + selectors.postButton);
       let container = document;
       if (editorSelector) {
         container = document.querySelector(editorSelector)?.parentElement;
@@ -424,7 +391,7 @@ export async function waitUntilReady(page, scope, images, weightedLength, editor
         uploading: attachments.some(el => el.querySelector('[role=progressbar]') || /uploading|processing|上传|处理/i.test(el.innerText)),
         toast: document.querySelector(selectors.toast)?.innerText || null,
       };
-    }, scope, SELECTORS, editorSelector, buttonSelector);
+    }, scope, SELECTORS, editorSelector);
     const now = Date.now();
     settled = !snapshot.uploading && (!images.length || snapshot.hasAttachments);
     readyPolls = snapshot.button === 'enabled' && settled ? readyPolls + 1 : 0;
@@ -486,11 +453,11 @@ function uncertain(toast) {
   });
 }
 
-async function submitPost(page, scope) {
+async function submitPost(page, selector) {
   await page.send('Network.enable');
   const watcher = watchCreateResponse(page);
   try {
-    try { await clickPostButton(page, scope); }
+    try { await page.click(selector); }
     catch (error) {
       if (error instanceof XPosterError && error.code === 'UI_CHANGED') throw error;
       throw uncertain();
@@ -528,11 +495,11 @@ function uncertainSchedule() {
   });
 }
 
-async function submitSchedule(page, scope) {
+async function submitSchedule(page, selector) {
   await page.send('Network.enable');
   const watcher = watchCreateResponse(page, /\/i\/api\/graphql\/[^/]+\/CreateScheduledTweet\b/);
   try {
-    try { await clickPostButton(page, scope); }
+    try { await page.click(selector); }
     catch (error) {
       if (error instanceof XPosterError && error.code === 'UI_CHANGED') throw error;
       throw uncertainSchedule();
@@ -756,13 +723,13 @@ export async function compose(browser, { text, images, submit, mode = submit ? '
       const x = Math.max(0, rect.x + scrollX - 12);
       const y = Math.max(0, rect.y + scrollY - 12);
       return { x, y, width: rect.right + scrollX + 12 - x, height: rect.bottom + scrollY + 12 - y };
-    }, scope + SELECTORS.editor, await postButtonSelector(page, scope));
+    }, scope + SELECTORS.editor, scope + SELECTORS.postButton);
     const screenshot = await page.screenshot(clip);
     await writeFile(screenshotPath, screenshot, { mode: 0o600 });
     const username = await readUsername(page);
     if (mode === 'preview') return { screenshot, username };
-    const id = mode === 'schedule' ? await submitSchedule(page, scope)
-      : await submitPost(page, scope);
+    const id = mode === 'schedule' ? await submitSchedule(page, scope + SELECTORS.postButton)
+      : await submitPost(page, scope + SELECTORS.postButton);
     return { screenshot, username, id };
   } catch (error) {
     if (error instanceof XPosterError && error.code === 'UI_CHANGED' && !Object.hasOwn(error.details, 'diagnostics')) {
@@ -777,6 +744,7 @@ export async function compose(browser, { text, images, submit, mode = submit ? '
 
 export async function openComposer(page, url = URLS.compose, screenshotPath) {
   await page.navigate(url);
+  try { await page.ensureRendering(); } catch { /* Rendering recovery is best effort. */ }
   const state = await page.waitFor(selector => {
     const path = location.pathname;
     if (path.startsWith('/login') || path.startsWith('/i/flow/')) return 'login';
@@ -799,6 +767,15 @@ export async function openComposer(page, url = URLS.compose, screenshotPath) {
   }
   const modal = await page.waitFor(selector => !!document.querySelector(selector),
     [`${SELECTORS.dialog} ${SELECTORS.editor}`], { timeout: 8000 });
-  const scope = modal ? `${SELECTORS.dialog} ` : '';
-  return scope;
+  if (modal) return `${SELECTORS.dialog} `;
+  const inlineOnly = await page.call(selectors =>
+    !!document.querySelector('[data-testid=tweetButtonInline]')
+    && !document.querySelector(selectors.postButton)
+    && !document.querySelector(selectors.editor)?.closest(selectors.dialog), SELECTORS);
+  if (inlineOnly) {
+    throw new XPosterError('UI_CHANGED', '发帖弹窗未出现（页面可能没有渲染），已停止，未输入任何内容。', {
+      diagnostics: await captureUIDiagnostics(page, screenshotPath),
+    });
+  }
+  return '';
 }

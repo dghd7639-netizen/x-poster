@@ -420,6 +420,7 @@ export async function createArticleDraft(browser, { title, segments, cover, scre
   try {
     await page.send('Network.enable');
     await page.navigate(ARTICLES_URL);
+    try { await page.ensureRendering(); } catch { /* Rendering recovery is best effort. */ }
     if (!await page.waitFor(selector => !!document.querySelector(selector), [ARTICLE_SELECTORS.create], { timeout: 30000 })) {
       throw new XPosterError('ARTICLES_UNAVAILABLE', 'X Articles 需要符合资格的 Premium 账号，当前账号无法新建文章。');
     }
@@ -489,6 +490,7 @@ export async function setArticleCover(browser, articleId, { cover, screenshotPat
   try {
     await page.send('Network.enable');
     await page.navigate(editURL(articleId));
+    try { await page.ensureRendering(); } catch { /* Rendering recovery is best effort. */ }
     await waitEditor(page, watcher, articleId, 'cover');
     const replaced = (await page.call(snapshot, ARTICLE_SELECTORS)).cover;
     const mark = watcher.mark();
@@ -553,6 +555,7 @@ export async function publishArticle(browser, articleId) {
   try {
     await page.send('Network.enable');
     await page.navigate(editURL(articleId));
+    try { await page.ensureRendering(); } catch { /* Rendering recovery is best effort. */ }
     await waitEditor(page, watcher, articleId, 'publish');
     if (!(await page.call(snapshot, ARTICLE_SELECTORS)).title.trim()) {
       throw new XPosterError('INVALID_INPUT', '文章标题不能为空。');
@@ -590,6 +593,7 @@ export async function deleteArticleDraft(browser, articleId) {
   try {
     await page.send('Network.enable');
     await page.navigate(editURL(articleId));
+    try { await page.ensureRendering(); } catch { /* Rendering recovery is best effort. */ }
     await waitEditor(page, watcher, articleId, 'delete');
     await page.press('Escape');
     await clickAction(page, 'more');
@@ -605,6 +609,7 @@ export async function deleteArticleDraft(browser, articleId) {
     const response = await waitMutation(watcher, /^ArticleEntityDelete\b/, articleId);
     if (!response?.ok || !Object.values(response.body.data).some(Boolean)) throw uncertain(articleId, '无法确认文章草稿已删除。');
     await page.navigate(ARTICLES_URL);
+    try { await page.ensureRendering(); } catch { /* Rendering recovery is best effort. */ }
     if (!await page.waitFor(selector => location.pathname === '/compose/articles' && !!document.querySelector(selector), [ARTICLE_SELECTORS.create])) {
       throw uncertain(articleId, '删除后的文章列表未加载。');
     }

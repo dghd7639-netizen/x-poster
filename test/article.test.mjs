@@ -162,6 +162,7 @@ function fixture(options = {}) {
   class DataTransfer { values = {}; setData(type, value) { this.values[type] = value; } }
   class ClipboardEvent { constructor(type, options) { Object.assign(this, options); } }
   const page = {
+    async ensureRendering() { calls.push(['ensureRendering']); },
     async navigate(url) {
       calls.push(['navigate', url]);
       state.pathname = state.redirect ?? new URL(url).pathname;
@@ -1739,4 +1740,21 @@ test('article browser wait ends with BUSY after fifteen simulated minutes withou
     assert.equal(f.opened.mock.callCount(), 0);
   } finally { gate.resolve(); await blocker; await pendingWork(); }
   assert.equal(f.opened.mock.callCount(), 0);
+});
+
+
+test('all article editor and list navigations recover rendering before inspecting the UI', async t => {
+  const draftInput = await input(t);
+  for (const action of [
+    f => createArticleDraft(f.browser, draftInput),
+    f => setArticleCover(f.browser, '123', { cover: '/tmp/cover.png', screenshotPath: draftInput.screenshotPath }),
+    f => publishArticle(f.browser, '123'),
+    f => deleteArticleDraft(f.browser, '123'),
+  ]) {
+    const f = fixture();
+    await runClock(t, () => action(f));
+    const navigations = f.calls.flatMap((call, index) => call[0] === 'navigate' ? [index] : []);
+    assert.ok(navigations.length > 0);
+    for (const index of navigations) assert.equal(f.calls[index + 1][0], 'ensureRendering');
+  }
 });
