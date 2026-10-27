@@ -1,4 +1,5 @@
-import { writeFile } from 'node:fs/promises';
+import { chmod, writeFile } from 'node:fs/promises';
+import { resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { XPosterError } from './errors.mjs';
 import { MAX_WEIGHTED_LENGTH } from './validate.mjs';
@@ -24,6 +25,101 @@ export const SELECTORS = {
   profileLink: '[data-testid=AppTabBar_Profile_Link]',
 };
 export const CREATE_POST_URL = /\/i\/api\/graphql\/[^/]+\/(?:Create(?:Tweet|Post|NoteTweet)|NoteTweet)\b/;
+
+async function diagnosticStep(action, timeout) {
+  let timer;
+  try {
+    return await Promise.race([
+      Promise.resolve().then(action),
+      new Promise(resolve => { timer = setTimeout(() => resolve(null), timeout); }),
+    ]);
+  } catch { return null; }
+  finally { clearTimeout(timer); }
+}
+
+function readUIDiagnostics(selectors) {
+  const dialogEditor = document.querySelector(`${selectors.dialog} ${selectors.editor}`);
+  const editor = dialogEditor ?? document.querySelector(selectors.editor);
+  let root = editor?.closest(selectors.dialog);
+  if (!root) {
+    let ancestor = editor?.parentElement;
+    for (let level = 0; ancestor && level < 6; level++, ancestor = ancestor.parentElement) {
+      // Never use the whole page as a composer: it can include account controls.
+      if (ancestor === document.body || ancestor === document.documentElement) break;
+      if (ancestor.querySelectorAll('button, [role=button]').length > 1) { root = ancestor; break; }
+    }
+  }
+  const maskTestid = value => value?.replace(/^UserAvatar-Container-[\s\S]*/, 'UserAvatar-Container-*')
+    .replace(/^\d+-/, '*-').replace(/\d{6,}/g, '*') ?? null;
+  const counts = new Map();
+  for (const element of root?.querySelectorAll('[data-testid]') ?? []) {
+    const id = maskTestid(element.getAttribute('data-testid'));
+    counts.set(id, (counts.get(id) ?? 0) + 1);
+  }
+  const pageTestids = {};
+  for (const id of ['tweetTextarea_0', 'tweetButton', 'tweetButtonInline', 'addButton', 'scheduleOption', 'fileInput',
+    'app-bar-close', 'toolBar', 'SideNav_NewTweet_Button', 'primaryColumn', 'sheetDialog', 'mask']) {
+    const count = document.querySelectorAll(`[data-testid="${id}"]`).length;
+    if (count) pageTestids[id] = count;
+  }
+  const actions = new Set(['tweetButton', 'tweetButtonInline', 'addButton', 'scheduleOption',
+    'scheduledConfirmationPrimaryAction', 'app-bar-close']);
+  const buttons = [...(root?.querySelectorAll('button, [role=button]') ?? [])].slice(0, 30).map(button => {
+    const testid = button.getAttribute('data-testid');
+    const maskedTestid = maskTestid(testid);
+    const label = (button.getAttribute('aria-label') || button.innerText || '').trim();
+    const privateLabel = label.includes('@') || maskedTestid !== testid
+      || !actions.has(testid) && /^[A-Za-z0-9_]{4,15}$/.test(label);
+    return { testid: maskedTestid, ...(privateLabel ? {} : { label: label.slice(0, 24) }),
+      disabled: !!button.disabled || button.getAttribute('aria-disabled') === 'true' };
+  });
+  let clip;
+  if (root) {
+    // An unmeasurable composer must not silently expand the screenshot to the timeline.
+    clip = false;
+    try {
+      const rect = root.getBoundingClientRect();
+      const x = Math.max(0, rect.x - 12);
+      const y = Math.max(0, rect.y - 12);
+      const width = Math.min(innerWidth, rect.right + 12) - x;
+      const height = Math.min(innerHeight, rect.bottom + 12) - y;
+      if (rect.width > 0 && rect.height > 0 && width > 0 && height > 0 && [x, y, width, height].every(Number.isFinite)) {
+        clip = { x: x + scrollX, y: y + scrollY, width, height };
+      }
+    } catch { /* Keep DOM diagnostics when the composer cannot be measured. */ }
+  }
+  const diagnostics = {
+    page_path: location.pathname,
+    viewport: { width: innerWidth, height: innerHeight },
+    ready_state: document.readyState,
+    has_dialog: !!document.querySelector(selectors.dialog),
+    editor_in_dialog: !!dialogEditor,
+    editor_present: !!editor,
+    testids: Object.fromEntries([...counts].sort(([a, ac], [b, bc]) => bc - ac || (a < b ? -1 : a > b ? 1 : 0)).slice(0, 60)),
+    page_testids: pageTestids,
+    composer_buttons: buttons,
+  };
+  return { diagnostics, clip };
+}
+
+export async function captureUIDiagnostics(page, screenshotPath) {
+  try {
+    const snapshot = await diagnosticStep(() => page.call(readUIDiagnostics, SELECTORS), 1500);
+    const diagnostics = snapshot?.diagnostics ?? {};
+    const screenshot = snapshot?.clip !== false && await diagnosticStep(() => page.screenshot(snapshot?.clip), 1500);
+    const path = screenshot && await diagnosticStep(async () => {
+      if (typeof screenshotPath !== 'string' || !/\.png$/.test(screenshotPath)) return null;
+      const path = resolve(screenshotPath.replace(/\.png$/, '-diagnostic.png'));
+      await writeFile(path, screenshot, { mode: 0o600 });
+      await chmod(path, 0o600);
+      return path;
+    }, 1000);
+    if (path) diagnostics.screenshot = path;
+    if (!Object.keys(diagnostics).length) return null;
+    diagnostics.captured_at = new Date().toISOString();
+    return diagnostics;
+  } catch { return null; }
+}
 
 export function parseCreatePostResponse(body) {
   let json;
@@ -604,7 +700,7 @@ export async function compose(browser, { text, images, submit, mode = submit ? '
   }
   const page = await browser.newPage();
   try {
-    const scope = await openComposer(page);
+    const scope = await openComposer(page, undefined, screenshotPath);
     if (text) await fillText(page, scope + SELECTORS.editor, text);
     if (images.length) await page.setFiles(scope + SELECTORS.fileInput, images);
     await waitUntilReady(page, scope, images, weightedLength);
@@ -631,13 +727,18 @@ export async function compose(browser, { text, images, submit, mode = submit ? '
     const id = mode === 'schedule' ? await submitSchedule(page, scope + SELECTORS.postButton)
       : await submitPost(page, scope + SELECTORS.postButton);
     return { screenshot, username, id };
+  } catch (error) {
+    if (error instanceof XPosterError && error.code === 'UI_CHANGED' && !Object.hasOwn(error.details, 'diagnostics')) {
+      error.details.diagnostics = await captureUIDiagnostics(page, screenshotPath);
+    }
+    throw error;
   } finally {
     // Cleanup failures must not turn a confirmed post into a retryable failure.
     await page.close().catch(error => console.error('关闭发帖标签页失败：', error));
   }
 }
 
-export async function openComposer(page, url = URLS.compose) {
+export async function openComposer(page, url = URLS.compose, screenshotPath) {
   await page.navigate(url);
   const state = await page.waitFor(selector => {
     const path = location.pathname;
@@ -656,6 +757,7 @@ export async function openComposer(page, url = URLS.compose) {
   if (!state) {
     throw new XPosterError('UI_CHANGED', '等待发帖编辑器超时。', {
       selector: SELECTORS.editor, hint: '可能是网络较慢或 X 页面发生了变化，请查看 Chrome 窗口。',
+      diagnostics: await captureUIDiagnostics(page, screenshotPath),
     });
   }
   const modal = await page.waitFor(selector => !!document.querySelector(selector),

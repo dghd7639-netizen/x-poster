@@ -4,7 +4,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { XPosterError } from './errors.mjs';
 import { expandHome } from './config.mjs';
 import { CREATE_POST_URL, SELECTORS, openComposer, fillText, waitUntilReady, setSchedule,
-  readUsername, parseCreatePostResponse, parseCreateScheduledResponse } from './x.mjs';
+  readUsername, parseCreatePostResponse, parseCreateScheduledResponse, captureUIDiagnostics } from './x.mjs';
 
 const normalized = text => text == null ? '' : typeof text === 'string' ? text.trim().replace(/\s+/gu, ' ') : null;
 const editorAt = index => `[data-testid=tweetTextarea_${index}]`;
@@ -315,9 +315,15 @@ export async function captureThread(page, screenshotPath, { label = 'thread', re
   }
 }
 
-async function withComposer(browser, url, action) {
+async function withComposer(browser, url, screenshotPath, action) {
   const page = await browser.newPage();
-  try { return await action(page, await openComposer(page, url)); }
+  try { return await action(page, await openComposer(page, url, screenshotPath)); }
+  catch (error) {
+    if (error instanceof XPosterError && error.code === 'UI_CHANGED' && !Object.hasOwn(error.details, 'diagnostics')) {
+      error.details.diagnostics = await captureUIDiagnostics(page, screenshotPath);
+    }
+    throw error;
+  }
   finally { await page.close().catch(error => console.error('关闭串文标签页失败：', error)); }
 }
 
@@ -331,7 +337,7 @@ export async function composeThread(browser, { posts, inReplyTo, scheduledAt, mo
     let replyTo = inReplyTo;
     for (const post of mode === 'preview' ? posts.slice(0, 1) : posts) {
       try {
-        await withComposer(browser, replyURL(replyTo), async (page, scope) => {
+        await withComposer(browser, replyURL(replyTo), screenshotPath, async (page, scope) => {
           const own = await checkOwnReply(page, scope, username || fallbackUsername);
           username = own.username;
           target ??= own;
@@ -357,7 +363,7 @@ export async function composeThread(browser, { posts, inReplyTo, scheduledAt, mo
     }
     if (mode !== 'preview') return { username, posted_ids: postedIds };
   }
-  return withComposer(browser, undefined, async (page, scope) => {
+  return withComposer(browser, undefined, screenshotPath, async (page, scope) => {
     await fillThread(page, scope, posts);
     if (scheduledAt) {
       await setSchedule(page, scope, scheduledAt);

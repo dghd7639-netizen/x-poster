@@ -109,6 +109,7 @@ function fixture(options = {}) {
   const selects = [range(1, 12), range(1, 31), range(2026, 2030), range(0, 23), range(0, 59)].map(values => new Select(values));
   const scheduleDialog = { querySelectorAll: () => selects };
   const document = {
+    readyState: 'complete',
     body: pageBody, documentElement: pageBody, scrollingElement: pageBody,
     get activeElement() { return state.activeElement; },
     querySelector(selector) {
@@ -146,6 +147,8 @@ function fixture(options = {}) {
       return runInNewContext(`(${fn.toString()})(...args)`, {
         args, document, location: state, DataTransfer, ClipboardEvent, Event, HTMLSelectElement: Select,
         window: { innerWidth: 1200, innerHeight: state.viewportHeight }, Node: { DOCUMENT_POSITION_FOLLOWING: 4 },
+        innerWidth: 1200, innerHeight: state.viewportHeight,
+        scrollX: 0, scrollY: 0,
         getComputedStyle: element => ({ overflowY: element.overflowY ?? 'visible' }),
         requestAnimationFrame: () => assert.fail('background tabs may pause animation frames'),
       });
@@ -337,6 +340,63 @@ test('immediate compose returns N sequential ids and closes its fresh page', { t
   assert.equal(f.events.size, 0);
 });
 
+test('thread UI_CHANGED captures diagnostics from fill, preview, submit and own-reply checks', { timeout: 4500 }, async () => {
+  for (const phase of ['fill', 'preview', 'submit', 'reply']) {
+    const f = fixture(phase === 'reply' ? { username: null } : {});
+    let original;
+    if (phase === 'fill' || phase === 'submit') {
+      original = new XPosterError('UI_CHANGED', '按钮已变化。', { hint: '保留提示', phase });
+      const click = f.page.click;
+      f.page.click = async selector => {
+        if (selector.endsWith(phase === 'fill' ? '[data-testid=addButton]' : '[data-testid=tweetButton]')) throw original;
+        return click(selector);
+      };
+    }
+    if (phase === 'preview') {
+      original = new XPosterError('UI_CHANGED', '无法调整预览区域。');
+      const send = f.page.send;
+      f.page.send = async (method, parameters) => {
+        if (method === 'Emulation.setDeviceMetricsOverride') throw original;
+        return send.call(f.page, method, parameters);
+      };
+    }
+    const screenshotPath = join(home, `diagnostics-${phase}.png`);
+    await assert.rejects(composeThread(f.browser, args({ screenshotPath,
+      mode: phase === 'preview' ? 'preview' : 'post', ...(phase === 'reply' ? { inReplyTo: '99' } : {}),
+    })), error => {
+      assert.equal(error.code, 'UI_CHANGED');
+      if (original) {
+        assert.equal(error, original);
+        if (phase !== 'preview') {
+          assert.equal(error.hint, '保留提示');
+          assert.equal(error.details.phase, phase);
+        }
+      }
+      assert.equal(error.details.diagnostics.page_path, '/compose/post');
+      assert.ok(error.details.diagnostics.testids);
+      assert.ok(error.details.diagnostics.composer_buttons);
+      assert.equal(error.details.diagnostics.screenshot, screenshotPath.replace('.png', '-diagnostic.png'));
+      return true;
+    });
+    assert.equal(f.page.closed, true);
+    assert.equal(f.events.size, 0);
+    assert.equal(f.calls.filter(call => call[0] === 'screenshot').length, 1);
+  }
+});
+
+test('thread login and challenge errors never collect diagnostics', async () => {
+  for (const [pathname, code] of [['/i/flow/login', 'NOT_LOGGED_IN'], ['/account/access', 'ACCOUNT_CHALLENGE']]) {
+    const f = fixture({ pathname });
+    await assert.rejects(composeThread(f.browser, args()), error => {
+      assert.equal(error.code, code);
+      assert.equal('diagnostics' in error.details, false);
+      return true;
+    });
+    assert.equal(f.calls.some(call => call[0] === 'screenshot'), false);
+    assert.equal(f.page.closed, true);
+  }
+});
+
 test('single thread_tweets request maps all confirmed ids', async () => {
   const f = fixture();
   const watcher = watchThreadResponses(f.page, input(['a', 'b']));
@@ -354,6 +414,7 @@ test('fewer than N confirmed ids after 90 s is UNCERTAIN with posted_ids; never 
   await submitted;
   const rejected = assert.rejects(action, error => {
     assert.equal(error.code, 'UNCERTAIN'); assert.deepEqual(error.details.posted_ids, ['100']);
+    assert.equal('diagnostics' in error.details, false);
     assert.equal(error.details.count, 2); assert.match(error.hint, /不要重试.*串文是否完整/); return true;
   });
   await Promise.resolve(); await Promise.resolve();
